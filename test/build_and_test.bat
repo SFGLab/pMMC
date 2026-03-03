@@ -7,7 +7,7 @@ setlocal
 
 set MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\MSBuild\15.0\Bin\amd64\MSBuild.exe
 set PROJDIR=%~dp0..
-set VCXPROJ=%PROJDIR%\MSVC++\cudaMMC.vcxproj
+set VCXPROJ=%PROJDIR%\MSVC++\pMMC.vcxproj
 set ERRORS=0
 
 echo ============================================================

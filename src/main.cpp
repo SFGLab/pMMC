@@ -33,7 +33,7 @@ std::atomic<bool> g_cancel_requested(false);
 std::map<char, std::string> args;
 
 void usage(const char *act = "", bool quit = true) {
-  printf("Usage: cudaMMC -a <action> [options]\n\n");
+  printf("Usage: pMMC -a <action> [options]\n\n");
   printf("Actions:\n");
   printf("  create (c)     Reconstruct 3D structure (default)\n");
   printf("  generate (g)   Generate synthetic polymer + ChIA-PET data\n");
@@ -58,7 +58,7 @@ void usage(const char *act = "", bool quit = true) {
   printf("  -m  ensemble size\n");
   printf("  -i  input file/directory\n");
   printf("\nOutput format:\n");
-  printf("  -F  output format: hcm (default), cif (mmCIF), pdb\n");
+  printf("  -F  additional output format: cif, mmcif, pdb, or both (HCM always written)\n");
   printf("  -E  enable per-step energy trace CSV\n");
   printf("  -L  energy log interval in MC steps (default: 1000)\n");
   printf("\nMemory:\n");

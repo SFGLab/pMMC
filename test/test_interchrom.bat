@@ -5,10 +5,10 @@ REM  Verifies multi-chromosome reconstruction works
 REM ============================================================
 setlocal
 
-set CUDAMMC=%~dp0..\build\Debug\cudaMMC.exe
-if not exist "%CUDAMMC%" set CUDAMMC=%~dp0..\build\Release\cudaMMC.exe
+set CUDAMMC=%~dp0..\build\Debug\pMMC.exe
+if not exist "%CUDAMMC%" set CUDAMMC=%~dp0..\build\Release\pMMC.exe
 if not exist "%CUDAMMC%" (
-    echo [SKIP] cudaMMC.exe not found. Build first.
+    echo [SKIP] pMMC.exe not found. Build first.
     exit /b 1
 )
 

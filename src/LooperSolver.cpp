@@ -1793,7 +1793,9 @@ Heatmap LooperSolver::normalizeHeatmap(const Heatmap &heat) {
     for (j = 0; j < n; ++j)
       sum += heat.v[i][j];
 
-    float mn = expected_sum / sum;
+    // Guard: if row sum is zero (no singletons for this segment), skip
+    // normalization to avoid NaN from 0 * Inf when sum == 0.
+    float mn = (sum > 1e-12f) ? (expected_sum / sum) : 0.0f;
 
     for (j = 0; j < n; ++j)
       h.v[i][j] = heat.v[i][j] * mn;
@@ -1924,6 +1926,13 @@ void LooperSolver::normalizeHeatmapDiagonalTotal(Heatmap &heat, float val) {
     avg += heat.v[i][i + diag];
   avg /= heat.size - diag;
   printf(" diagonal avg = %lf\n", avg);
+
+  // Guard: if avg is zero, NaN, or near-zero, skip normalization to avoid
+  // Inf/NaN propagation into the MC scoring kernel.
+  if (!(avg > 1e-12)) {
+    printf(" diagonal avg is zero/invalid, skipping near-diagonal normalization\n");
+    return;
+  }
 
   float mn = static_cast<float>(val / avg);
   for (size_t i = 0; i < heat.size; ++i) {

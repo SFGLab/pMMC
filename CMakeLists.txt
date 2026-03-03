@@ -4,21 +4,21 @@ project(3dgnome LANGUAGES C CXX CUDA)
 set(SOURCES
   src/main.cpp
   src/Anchor.cpp
-  src/ChromosomesSet.cpp
+  src/chromosomesset.cpp
   src/HierarchicalChromosome.cu
   src/LooperSolver.cpp
   src/BedRegion.cpp
-  src/Cluster.cpp
+  src/cluster.cpp
   src/InteractionArc.cpp
   src/ParallelMarkArcs.cu
   src/BedRegions.cpp
-  src/Density.cpp
+  src/density.cpp
   src/InteractionArcs.cpp
   src/ParallelMonteCarloHeatmap.cu
   src/ParallelMonteCarloArcs.cu
   src/ParallelMonteCarloSmooth.cu
-  src/Chromosome.cpp
-  src/Heatmap.cpp
+  src/chromosome.cpp
+  src/heatmap.cpp
   src/Settings.cpp
   src/SyntheticGenerator.cpp
   src/BenchmarkRunner.cpp
@@ -72,41 +72,41 @@ set(HEADERS
   thirdparty/rmsd.h
 )
 
-add_executable(cudaMMC)
+add_executable(pMMC)
 
 # Platform-specific compiler options
 if(MSVC)
-  target_compile_options(cudaMMC PUBLIC /W3)
-  target_compile_definitions(cudaMMC PUBLIC _CRT_SECURE_NO_WARNINGS)
+  target_compile_options(pMMC PUBLIC /W3)
+  target_compile_definitions(pMMC PUBLIC _CRT_SECURE_NO_WARNINGS)
 else()
-  target_compile_options(cudaMMC PUBLIC -Wall)
+  target_compile_options(pMMC PUBLIC -Wall)
 endif()
 
-target_compile_features(cudaMMC PUBLIC cxx_std_17)
-set_target_properties(cudaMMC PROPERTIES CXX_STANDARD 17)
-set_target_properties(cudaMMC PROPERTIES CMAKE_CUDA_STANDARD 11)
-set_target_properties(cudaMMC PROPERTIES CMAKE_CUDA_STANDARD_REQUIRED ON)
+target_compile_features(pMMC PUBLIC cxx_std_17)
+set_target_properties(pMMC PROPERTIES CXX_STANDARD 17)
+set_target_properties(pMMC PROPERTIES CMAKE_CUDA_STANDARD 11)
+set_target_properties(pMMC PROPERTIES CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT CUDA_ARCH)
   message(SEND_ERROR "YOU NEED TO SPECIFY CUDA ARCHITECTURE E.G. -DCUDA_ARCH=\"80\"")
 endif()
 
-set_target_properties(cudaMMC PROPERTIES CUDA_ARCHITECTURES "${CUDA_ARCH}")
+set_target_properties(pMMC PROPERTIES CUDA_ARCHITECTURES "${CUDA_ARCH}")
 
-set_target_properties(cudaMMC PROPERTIES CUDA_RUNTIME_LIBRARY static)
+set_target_properties(pMMC PROPERTIES CUDA_RUNTIME_LIBRARY static)
 
-target_include_directories(cudaMMC PUBLIC
+target_include_directories(pMMC PUBLIC
   ${CMAKE_SOURCE_DIR}/thirdparty/
   ${CMAKE_SOURCE_DIR}/include/
 )
 
-target_sources(cudaMMC PUBLIC ${SOURCES} ${HEADERS})
+target_sources(pMMC PUBLIC ${SOURCES} ${HEADERS})
 
-set_target_properties(cudaMMC PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(pMMC PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-set_property(TARGET cudaMMC PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+set_property(TARGET pMMC PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 # Link psapi on Windows for GetProcessMemoryInfo (memory instrumentation)
 if(WIN32)
-  target_link_libraries(cudaMMC PUBLIC psapi)
+  target_link_libraries(pMMC PUBLIC psapi)
 endif()

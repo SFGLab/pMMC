@@ -43,12 +43,13 @@ Set `CUDA_ARCH` to match your GPU architecture:
 | Volta (V100) | 70 |
 | Turing (RTX 20xx) | 75 |
 | Ampere (RTX 30xx, A100) | 80, 86 |
+| Ada Lovelace (RTX 40xx) | 89 |
 
 Multiple architectures can be specified: `-DCUDA_ARCH="70;75;80"`
 
 ### Windows
 
-Open the Visual Studio project in `MSVC++/` or use CMake:
+Open the Visual Studio solution (`MSVC++/pMMC.sln`) or use CMake:
 
 ```cmd
 mkdir build && cd build
@@ -59,8 +60,8 @@ cmake --build . --config Release
 ### Docker
 
 ```bash
-docker build -t cudammc:11.8 .
-docker run --gpus all -it cudammc:11.8
+docker build -t pmmc:11.8 .
+docker run --gpus all -it pmmc:11.8
 ```
 
 The Docker image builds for architectures 60, 70, 75, 80, and 86.
@@ -68,7 +69,7 @@ The Docker image builds for architectures 60, 70, 75, 80, and 86.
 ## Usage
 
 ```
-cudaMMC -a <action> [options]
+pMMC -a <action> [options]
 ```
 
 ### Actions
@@ -99,7 +100,7 @@ cudaMMC -a <action> [options]
 | `-m N` | Ensemble size (number of structures to generate) |
 | `-j SEED` | Fixed random seed for reproducibility |
 | `-i FILE` | Input file or directory |
-| `-F FORMAT` | Output format: `hcm` (default), `cif`, `pdb`, or `both` |
+| `-F FORMAT` | Additional output format: `cif` (mmCIF), `pdb`, or `both` (HCM is always written) |
 | `-M MB` | Memory budget in MB (0 = unlimited) |
 | `-I METHOD` | Initialization method: `random` (default) or `mds` |
 | `-E` | Enable per-step energy trace CSV |
@@ -110,44 +111,44 @@ cudaMMC -a <action> [options]
 **Reconstruct a single chromosome:**
 
 ```bash
-cudaMMC -a create -s config.ini -c chr14 -n my_run -o ./output/
+pMMC -a create -s config.ini -c chr14 -n my_run -o ./output/
 ```
 
 **Reconstruct entire genome as an ensemble of 10 structures:**
 
 ```bash
-cudaMMC -a create -s config.ini -c genome -m 10 -o ./ensemble/ -F both
+pMMC -a create -s config.ini -c genome -m 10 -o ./ensemble/ -F both
 ```
 
 **Reconstruct a specific genomic region with a fixed seed:**
 
 ```bash
-cudaMMC -a create -s config.ini -c chr14:1:2500000 -j 42 -o ./region/
+pMMC -a create -s config.ini -c chr14:1:2500000 -j 42 -o ./region/
 ```
 
 **Generate synthetic data and benchmark:**
 
 ```bash
-cudaMMC -a generate -c chr22 -l 100 -m 20 -o ./synthetic/
-cudaMMC -a benchmark -c chr22 -m 20 -o ./benchmark/
+pMMC -a generate -c chr22 -l 100 -m 20 -o ./synthetic/
+pMMC -a benchmark -c chr22 -m 20 -o ./benchmark/
 ```
 
 **Compare two structures:**
 
 ```bash
-cudaMMC -a metrics -i structure_a.hcm,structure_b.hcm -o ./comparison/
+pMMC -a metrics -i structure_a.hcm,structure_b.hcm -o ./comparison/
 ```
 
 **Extract distance and contact maps:**
 
 ```bash
-cudaMMC -a distmap -i model.hcm -c chr14 -r 25000 -o ./maps/
+pMMC -a distmap -i model.hcm -c chr14 -r 25000 -o ./maps/
 ```
 
 **Ensemble pairwise analysis:**
 
 ```bash
-cudaMMC -a ensemble -i ./models/ -p "model_{N}.hcm"
+pMMC -a ensemble -i ./models/ -p "model_{N}.hcm"
 ```
 
 ## Configuration
@@ -174,7 +175,16 @@ blocks_multiplier = 16    # Grid size multiplier
 milestone_fails = 3       # Max consecutive failures before stopping
 ```
 
-### `[simulation_heatmap]` / `[simulation_arcs]` - Monte Carlo parameters
+### `[simulation_heatmap]` - Heatmap-level Monte Carlo parameters
+
+```ini
+max_temp_heatmap = 5.0                                    # Starting temperature
+delta_temp_heatmap = 0.9999                               # Cooling rate
+stop_condition_improvement_threshold_heatmap = 0.99        # Convergence threshold
+stop_condition_steps_heatmap = 50000                       # Steps per milestone
+```
+
+### `[simulation_arcs]` - Arc-level Monte Carlo parameters
 
 ```ini
 max_temp = 5.0                                # Starting temperature
@@ -199,7 +209,7 @@ squeeze_constant = 0.1     # Linker compression penalty
 angular_constant = 0.1     # Bending angle penalty
 ```
 
-See `config.ini` for the full list of ~120 configurable parameters.
+See `config.ini` for the full list of ~110 configurable parameters.
 
 ## Input Data
 
@@ -240,12 +250,12 @@ Each level uses parallel CUDA Monte Carlo with Metropolis acceptance and simulat
 ## Project Structure
 
 ```
-pMMC~/
+pMMC/
 ├── src/                    C++ and CUDA source files
 │   ├── main.cpp            CLI entry point
 │   ├── LooperSolver.cpp    Main reconstruction engine
-│   ├── Heatmap.cpp         Contact frequency matrices
-│   ├── Chromosome.cpp      Bead-chain polymer model
+│   ├── heatmap.cpp         Contact frequency matrices
+│   ├── chromosome.cpp      Bead-chain polymer model
 │   ├── HierarchicalChromosome.cu   Hierarchical tree (CUDA)
 │   ├── ParallelMonteCarlo*.cu      MC simulation kernels
 │   ├── SyntheticGenerator.cpp      Synthetic data generation
@@ -256,7 +266,7 @@ pMMC~/
 ├── include/                Header files with Doxygen documentation
 ├── thirdparty/             Bundled dependencies (INI parser, RMSD, matrix lib)
 ├── test/                   Test and CI scripts (.bat)
-├── MSVC++/                 Visual Studio project files
+├── MSVC++/                 Visual Studio solution and project files
 ├── config.ini              Default configuration with inline docs
 ├── CMakeLists.txt          CMake build configuration
 └── Dockerfile              NVIDIA CUDA container build

@@ -7,7 +7,7 @@ setlocal
 
 set MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\MSBuild\15.0\Bin\amd64\MSBuild.exe
 set PROJDIR=%~dp0..
-set VCXPROJ=%PROJDIR%\MSVC++\cudaMMC.vcxproj
+set VCXPROJ=%PROJDIR%\MSVC++\pMMC.vcxproj
 set TOTAL_PASS=0
 set TOTAL_FAIL=0
 set TOTAL_SKIP=0
@@ -162,8 +162,8 @@ REM ====== GATE 3: RUNTIME TESTS (if exe exists) ======
 echo ============ GATE 3: RUNTIME TESTS ============
 echo.
 
-set CUDAMMC=%PROJDIR%\build\Debug\cudaMMC.exe
-if not exist "%CUDAMMC%" set CUDAMMC=%PROJDIR%\build\Release\cudaMMC.exe
+set CUDAMMC=%PROJDIR%\build\Debug\pMMC.exe
+if not exist "%CUDAMMC%" set CUDAMMC=%PROJDIR%\build\Release\pMMC.exe
 if exist "%CUDAMMC%" (
     echo [Runtime] Executable found: %CUDAMMC%
     echo [Runtime] Running determinism test...
