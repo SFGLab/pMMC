@@ -27,7 +27,8 @@ public:
    * @param filename Output file path.
    * @return True on success.
    */
-  static bool write(HierarchicalChromosome &hc, const std::string &filename);
+  static bool write(HierarchicalChromosome &hc, const std::string &filename,
+                    bool useCurrentLevel = false);
 
   /**
    * @brief Write a flat list of positions to PDB.

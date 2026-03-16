@@ -70,6 +70,116 @@ static inline void gpuAssertArcs(cudaError_t code, const char *file, int line,
 }
 
 /* ======================================================================
+ * GpuResourceCache — persistent GPU resources across all interaction blocks.
+ * Eliminates per-block cudaMalloc/cudaFree overhead for curandState and
+ * isDone flags, which dominates runtime when processing 100-200 blocks.
+ * ====================================================================== */
+/* Helper to access the opaque dev_prop storage as cudaDeviceProp. */
+static inline cudaDeviceProp &cache_dev_prop(GpuResourceCache &c) {
+  static_assert(sizeof(cudaDeviceProp) <= sizeof(c.dev_prop_storage),
+                "dev_prop_storage too small for cudaDeviceProp");
+  return *reinterpret_cast<cudaDeviceProp *>(c.dev_prop_storage);
+}
+
+void GpuResourceCache::init() {
+  if (initialized) return;
+
+  cudaError_t err = cudaGetDevice(&dev_id);
+  if (err != cudaSuccess) return;
+  cudaGetDeviceProperties(&cache_dev_prop(*this), dev_id);
+  sm_count = cache_dev_prop(*this).multiProcessorCount;
+
+  /* Pre-allocate curandState for arcs: sm_count blocks × 128 threads */
+  arcs_states_count = sm_count * 128;
+  curandState *arcs_ptr = nullptr;
+  err = cudaMalloc(&arcs_ptr, (size_t)arcs_states_count * sizeof(curandState));
+  if (err != cudaSuccess) { arcs_states_count = 0; return; }
+  d_arcs_states = arcs_ptr;
+
+  /* Pre-allocate curandState for smooth: sm_count*2 blocks × 32 threads */
+  smooth_states_count = sm_count * 2 * 32;
+  curandState *smooth_ptr = nullptr;
+  err = cudaMalloc(&smooth_ptr, (size_t)smooth_states_count * sizeof(curandState));
+  if (err != cudaSuccess) { smooth_states_count = 0; return; }
+  d_smooth_states = smooth_ptr;
+
+  /* Pre-allocate isDone flags */
+  bool *arcs_done = nullptr, *smooth_done = nullptr;
+  cudaMalloc(&arcs_done, sizeof(bool));
+  cudaMalloc(&smooth_done, sizeof(bool));
+  d_arcs_isDone = arcs_done;
+  d_smooth_isDone = smooth_done;
+
+  initialized = true;
+  printf("[GpuResourceCache] Initialized: sm_count=%d, arcs_threads=%d, smooth_threads=%d\n",
+         sm_count, arcs_states_count, smooth_states_count);
+}
+
+void GpuResourceCache::initArcsBuffers(int max_n, int max_warps, int max_loops) {
+  if (max_n <= arcs_max_n && max_warps <= arcs_max_warps && max_loops <= arcs_max_loops)
+    return; // already big enough
+
+  // Free old buffers if any
+  if (d_arcs_positions) cudaFree(d_arcs_positions);
+  if (d_arcs_is_fixed)  cudaFree(d_arcs_is_fixed);
+  if (d_arcs_exp_dist)  cudaFree(d_arcs_exp_dist);
+  if (d_arcs_loop_pairs) cudaFree(d_arcs_loop_pairs);
+  if (d_arcs_loop_params) cudaFree(d_arcs_loop_params);
+  if (d_arcs_best_score) cudaFree(d_arcs_best_score);
+  if (d_arcs_best_pos)  cudaFree(d_arcs_best_pos);
+
+  arcs_max_n = max_n;
+  arcs_max_warps = max_warps;
+  if (max_loops > arcs_max_loops) arcs_max_loops = max_loops;
+  if (arcs_max_loops < 1) arcs_max_loops = 1;
+
+  cudaMalloc(&d_arcs_positions, (size_t)max_n * sizeof(float3));
+  cudaMalloc(&d_arcs_is_fixed, (size_t)max_n * sizeof(int));
+  cudaMalloc(&d_arcs_exp_dist, (size_t)max_n * max_n * sizeof(float));
+  cudaMalloc(&d_arcs_loop_pairs, (size_t)arcs_max_loops * sizeof(int2));
+  cudaMalloc(&d_arcs_loop_params, (size_t)arcs_max_loops * sizeof(float2));
+  cudaMalloc(&d_arcs_best_score, (size_t)max_warps * sizeof(float));
+  cudaMalloc(&d_arcs_best_pos, (size_t)max_warps * max_n * sizeof(float3));
+}
+
+void GpuResourceCache::initSmoothBuffers(int max_n) {
+  if (max_n <= smooth_max_n) return;
+
+  if (d_smooth_positions) cudaFree(d_smooth_positions);
+  if (d_smooth_fixed) cudaFree(d_smooth_fixed);
+  if (d_smooth_dist) cudaFree(d_smooth_dist);
+
+  smooth_max_n = max_n;
+  cudaMalloc(&d_smooth_positions, (size_t)max_n * sizeof(float3));
+  cudaMalloc(&d_smooth_fixed, (size_t)max_n * sizeof(bool));
+  cudaMalloc(&d_smooth_dist, (size_t)max_n * sizeof(float));
+}
+
+void GpuResourceCache::cleanup() {
+  if (d_arcs_states) { cudaFree(d_arcs_states); d_arcs_states = nullptr; }
+  if (d_smooth_states) { cudaFree(d_smooth_states); d_smooth_states = nullptr; }
+  if (d_arcs_isDone) { cudaFree(d_arcs_isDone); d_arcs_isDone = nullptr; }
+  if (d_smooth_isDone) { cudaFree(d_smooth_isDone); d_smooth_isDone = nullptr; }
+  if (d_arcs_positions) { cudaFree(d_arcs_positions); d_arcs_positions = nullptr; }
+  if (d_arcs_is_fixed) { cudaFree(d_arcs_is_fixed); d_arcs_is_fixed = nullptr; }
+  if (d_arcs_exp_dist) { cudaFree(d_arcs_exp_dist); d_arcs_exp_dist = nullptr; }
+  if (d_arcs_loop_pairs) { cudaFree(d_arcs_loop_pairs); d_arcs_loop_pairs = nullptr; }
+  if (d_arcs_loop_params) { cudaFree(d_arcs_loop_params); d_arcs_loop_params = nullptr; }
+  if (d_arcs_best_score) { cudaFree(d_arcs_best_score); d_arcs_best_score = nullptr; }
+  if (d_arcs_best_pos) { cudaFree(d_arcs_best_pos); d_arcs_best_pos = nullptr; }
+  if (d_smooth_positions) { cudaFree(d_smooth_positions); d_smooth_positions = nullptr; }
+  if (d_smooth_fixed) { cudaFree(d_smooth_fixed); d_smooth_fixed = nullptr; }
+  if (d_smooth_dist) { cudaFree(d_smooth_dist); d_smooth_dist = nullptr; }
+  arcs_states_seeded = false;
+  smooth_states_seeded = false;
+  arcs_max_n = 0;
+  arcs_max_warps = 0;
+  arcs_max_loops = 0;
+  smooth_max_n = 0;
+  initialized = false;
+}
+
+/* ======================================================================
  * Static seed — set once by LooperSolver::setArcsGpuSeed()
  * ====================================================================== */
 static unsigned int s_arcs_gpu_seed = 0; /* 0 = use time(NULL) */
@@ -325,7 +435,7 @@ __global__ void MonteCarloArcsKernel(
    * ------------------------------------------------------------------ */
 #define ARCS_INNER_N 256
 
-  while (!(*d_isDone)) {
+  while (!(*d_isDone) && iterations < settings.MCstopConditionSteps) {
 
 #pragma unroll 4
     for (int inner = 0; inner < ARCS_INNER_N; ++inner) {
@@ -486,43 +596,25 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
    * ------------------------------------------------------------------ */
   rebuildActiveLoopMap();
 
-  int deviceCount = 0;
-  cudaError_t cudaStatus = cudaGetDeviceCount(&deviceCount);
-  if (cudaStatus != cudaSuccess || deviceCount == 0) {
-    printf("[parallelMonteCarloArcs] No CUDA device — falling back to CPU.\n");
-    return static_cast<float>(MonteCarloArcs(step_size));
+  if (!gpu_cache.initialized) {
+    gpu_cache.init();
+    if (!gpu_cache.initialized) {
+      printf("[parallelMonteCarloArcs] No CUDA device — falling back to CPU.\n");
+      return static_cast<float>(MonteCarloArcs(step_size));
+    }
   }
 
   /* ------------------------------------------------------------------
-   * Determine launch configuration.
+   * Determine launch configuration using cached device properties.
    * ------------------------------------------------------------------ */
-  int threads_per_block = Settings::cudaThreadsPerBlock;
-  /* Ensure multiple of 32 (warp size). */
-  threads_per_block = ((threads_per_block + 31) / 32) * 32;
-  if (threads_per_block < 32) threads_per_block = 32;
+  int threads_per_block = 128;
+  int sm_count = gpu_cache.sm_count;
 
-  int blocks = static_cast<int>(Settings::cudaBlocksMultiplier *
-                                active_region.size());
+  int blocks = sm_count;
   if (blocks < 1) blocks = 1;
 
   int total_threads = threads_per_block * blocks;
   int n_warps       = total_threads / 32;
-
-  /* Cap curandState allocation at 256MB. */
-  {
-    size_t state_bytes = (size_t)total_threads * sizeof(curandState);
-    size_t max_bytes   = 256ULL * 1024 * 1024;
-    if (state_bytes > max_bytes) {
-      int max_threads = (int)(max_bytes / sizeof(curandState));
-      max_threads = (max_threads / threads_per_block) * threads_per_block;
-      if (max_threads < threads_per_block) max_threads = threads_per_block;
-      total_threads = max_threads;
-      blocks        = max_threads / threads_per_block;
-      n_warps       = total_threads / 32;
-      printf("[GPU Arcs] Capping to %d blocks (curandState 256MB limit)\n",
-             blocks);
-    }
-  }
 
   /* Shared memory: one float3 slot per bead per warp-in-block. */
   int warps_per_block = threads_per_block / 32;
@@ -530,15 +622,8 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
 
   /* Check shared memory limit and occupancy. */
   {
-    int dev = 0;
-    cudaDeviceProp prop;
-    cudaGetDevice(&dev);
-    cudaGetDeviceProperties(&prop, dev);
+    const cudaDeviceProp &prop = cache_dev_prop(gpu_cache);
     if (smem_bytes > (size_t)prop.sharedMemPerBlock) {
-      printf("[GPU Arcs] smem %zu bytes > limit %zu bytes — "
-             "reducing warps per block\n",
-             smem_bytes, (size_t)prop.sharedMemPerBlock);
-      /* Reduce warps_per_block until it fits. */
       warps_per_block = (int)(prop.sharedMemPerBlock / (n * sizeof(float3)));
       if (warps_per_block < 1) {
         printf("[GPU Arcs] Active region too large for GPU shared memory "
@@ -553,8 +638,6 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
       smem_bytes        = (size_t)warps_per_block * n * sizeof(float3);
     }
 
-    /* Verify occupancy: reduce threads_per_block until the kernel can launch.
-     * This handles Debug builds where -G inflates register usage. */
     int numBlocks = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &numBlocks, MonteCarloArcsKernel, threads_per_block,
@@ -571,7 +654,6 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
       printf("[GPU Arcs] Cannot achieve occupancy — falling back to CPU.\n");
       return static_cast<float>(MonteCarloArcs(step_size));
     }
-    /* Recompute grid dims after possible thread reduction. */
     blocks        = (n_warps * 32 + threads_per_block - 1) / threads_per_block;
     if (blocks < 1) blocks = 1;
     total_threads = threads_per_block * blocks;
@@ -602,43 +684,54 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
   gpu_settings.milestoneFailsThreshold    = Settings::milestoneFailsThreshold;
 
   /* ------------------------------------------------------------------
-   * Build host arrays for GPU upload.
+   * Ensure pre-allocated device buffers are large enough.
+   * ------------------------------------------------------------------ */
+  int n_loops = static_cast<int>(active_loop_map.size());
+  gpu_cache.initArcsBuffers(n, n_warps, n_loops > 0 ? n_loops : 1);
+
+  /* ------------------------------------------------------------------
+   * Build host arrays and upload via cached device buffers (cudaMemcpy).
+   * This avoids thrust::device_vector alloc/free per call.
    * ------------------------------------------------------------------ */
 
-  /* 1. Positions (float3, full precision — arc distances need it). */
-  thrust::host_vector<float3> h_positions(n);
-  for (int i = 0; i < n; ++i) {
-    h_positions[i].x = clusters[active_region[i]].pos.x;
-    h_positions[i].y = clusters[active_region[i]].pos.y;
-    h_positions[i].z = clusters[active_region[i]].pos.z;
-  }
-
-  /* 2. is_fixed flags (use int to avoid thrust::device_vector<bool> bit-packing). */
-  thrust::host_vector<int> h_is_fixed(n);
-  for (int i = 0; i < n; ++i)
-    h_is_fixed[i] = clusters[active_region[i]].is_fixed ? 1 : 0;
-
-  /* 3. Expected-distance matrix (NxN, row-major).
-   *    heatmap_exp_dist_anchor.v[i][j] is already in active-region space.
-   *    Negative values = no arc / repulsion;  [0, 1e-6) = ignore;
-   *    >= 1e-6 = arc pair. */
-  int n_sq = n * n;
-  thrust::host_vector<float> h_exp_dist(n_sq, -1.0f);
-  if ((int)heatmap_exp_dist_anchor.size == n) {
-    for (int i = 0; i < n; ++i)
-      for (int j = 0; j < n; ++j)
-        h_exp_dist[i * n + j] = heatmap_exp_dist_anchor.v[i][j];
-  } else {
-    printf("[GPU Arcs] Warning: heatmap_exp_dist_anchor size mismatch "
-           "(%zu vs %d) — scoring disabled.\n",
-           heatmap_exp_dist_anchor.size, n);
-  }
-
-  /* 4. Loop constraints — flatten active_loop_map. */
-  int n_loops = static_cast<int>(active_loop_map.size());
-  thrust::host_vector<int2>   h_loop_pairs(n_loops);
-  thrust::host_vector<float2> h_loop_params(n_loops);
+  /* 1. Positions */
   {
+    std::vector<float3> h_positions(n);
+    for (int i = 0; i < n; ++i) {
+      h_positions[i].x = clusters[active_region[i]].pos.x;
+      h_positions[i].y = clusters[active_region[i]].pos.y;
+      h_positions[i].z = clusters[active_region[i]].pos.z;
+    }
+    cudaMemcpy(gpu_cache.d_arcs_positions, h_positions.data(),
+               n * sizeof(float3), cudaMemcpyHostToDevice);
+  }
+
+  /* 2. is_fixed flags */
+  {
+    std::vector<int> h_is_fixed(n);
+    for (int i = 0; i < n; ++i)
+      h_is_fixed[i] = clusters[active_region[i]].is_fixed ? 1 : 0;
+    cudaMemcpy(gpu_cache.d_arcs_is_fixed, h_is_fixed.data(),
+               n * sizeof(int), cudaMemcpyHostToDevice);
+  }
+
+  /* 3. Expected-distance matrix (NxN, row-major) */
+  {
+    int n_sq = n * n;
+    std::vector<float> h_exp_dist(n_sq, -1.0f);
+    if ((int)heatmap_exp_dist_anchor.size == n) {
+      for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+          h_exp_dist[i * n + j] = heatmap_exp_dist_anchor.v[i][j];
+    }
+    cudaMemcpy(gpu_cache.d_arcs_exp_dist, h_exp_dist.data(),
+               n_sq * sizeof(float), cudaMemcpyHostToDevice);
+  }
+
+  /* 4. Loop constraints */
+  if (n_loops > 0) {
+    std::vector<int2>   h_loop_pairs(n_loops);
+    std::vector<float2> h_loop_params(n_loops);
     int k = 0;
     for (const auto &entry : active_loop_map) {
       h_loop_pairs[k].x  = entry.first.first;
@@ -648,84 +741,72 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
       h_loop_params[k].y = lc.eq_distance;
       ++k;
     }
+    cudaMemcpy(gpu_cache.d_arcs_loop_pairs, h_loop_pairs.data(),
+               n_loops * sizeof(int2), cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_cache.d_arcs_loop_params, h_loop_params.data(),
+               n_loops * sizeof(float2), cudaMemcpyHostToDevice);
   }
 
-  /* ------------------------------------------------------------------
-   * GPU allocations via thrust.
-   * ------------------------------------------------------------------ */
-  thrust::device_vector<float3> d_positions   = h_positions;
-  thrust::device_vector<int>    d_is_fixed    = h_is_fixed;
-  thrust::device_vector<float>  d_exp_dist    = h_exp_dist;
-
-  thrust::device_vector<int2>   d_loop_pairs;
-  thrust::device_vector<float2> d_loop_params;
-  if (n_loops > 0) {
-    d_loop_pairs  = h_loop_pairs;
-    d_loop_params = h_loop_params;
-  } else {
-    /* Allocate dummy 1-element arrays to keep device pointers valid. */
-    d_loop_pairs.resize(1);
-    d_loop_params.resize(1);
+  /* 5. Initialize best scores to FLT_MAX */
+  {
+    std::vector<float> init_scores(n_warps, FLT_MAX);
+    cudaMemcpy(gpu_cache.d_arcs_best_score, init_scores.data(),
+               n_warps * sizeof(float), cudaMemcpyHostToDevice);
   }
 
-  /* Per-warp output: best score and corresponding positions. */
-  thrust::device_vector<float>  d_best_score(n_warps, FLT_MAX);
-  thrust::device_vector<float3> d_best_positions((size_t)n_warps * n);
+  /* Pointers for kernel launch */
+  float3 *d_positions_ptr = static_cast<float3 *>(gpu_cache.d_arcs_positions);
+  int    *d_is_fixed_ptr  = static_cast<int *>(gpu_cache.d_arcs_is_fixed);
+  float  *d_exp_dist_ptr  = static_cast<float *>(gpu_cache.d_arcs_exp_dist);
+  int2   *d_loop_pairs_ptr  = static_cast<int2 *>(gpu_cache.d_arcs_loop_pairs);
+  float2 *d_loop_params_ptr = static_cast<float2 *>(gpu_cache.d_arcs_loop_params);
+  float  *d_best_score_ptr  = static_cast<float *>(gpu_cache.d_arcs_best_score);
+  float3 *d_best_pos_ptr    = static_cast<float3 *>(gpu_cache.d_arcs_best_pos);
 
-  /* isDone flag. */
-  bool *d_isDone = nullptr;
-  gpuErrchkArcs(cudaMalloc(&d_isDone, sizeof(bool)));
+  /* Use cached isDone flag and curandState */
+  bool *d_isDone = static_cast<bool *>(gpu_cache.d_arcs_isDone);
   gpuErrchkArcs(cudaMemset(d_isDone, 0, sizeof(bool)));
 
-  /* curandState. */
-  curandState *d_states = nullptr;
-  gpuErrchkArcs(
-      cudaMalloc(&d_states, (size_t)total_threads * sizeof(curandState)));
+  curandState *d_states = static_cast<curandState *>(gpu_cache.d_arcs_states);
 
-  /* ------------------------------------------------------------------
-   * Seed selection (reproducible if s_arcs_gpu_seed != 0).
-   * ------------------------------------------------------------------ */
-  unsigned int seed = (s_arcs_gpu_seed != 0)
-                          ? s_arcs_gpu_seed
-                          : static_cast<unsigned int>(time(NULL));
-
-  arcs_setupKernel<<<blocks, threads_per_block>>>(d_states, seed);
-  gpuErrchkArcs(cudaDeviceSynchronize());
-
-  /* ------------------------------------------------------------------
-   * Compute initial score on host (for logging).
-   * ------------------------------------------------------------------ */
-  double score_init =
-      calcScoreDistancesActiveRegion() + calcScoreLoopEnergy();
-  output(4, "[GPU Arcs] initial score = %lf, step_size = %f\n",
-         score_init, step_size);
+  /* Seed RNG only once (first call), then reuse. Each call continues
+   * the RNG sequence from where the previous call left off. */
+  if (!gpu_cache.arcs_states_seeded) {
+    unsigned int seed = (s_arcs_gpu_seed != 0)
+                            ? s_arcs_gpu_seed
+                            : static_cast<unsigned int>(time(NULL));
+    arcs_setupKernel<<<blocks, threads_per_block>>>(d_states, seed);
+    gpuErrchkArcs(cudaDeviceSynchronize());
+    gpu_cache.arcs_states_seeded = true;
+  }
 
   /* ------------------------------------------------------------------
    * Launch kernel.
+   * The cudaMemcpy(D→H) below will implicitly synchronize.
    * ------------------------------------------------------------------ */
   MonteCarloArcsKernel<<<blocks, threads_per_block, smem_bytes>>>(
       d_states,
-      thrust::raw_pointer_cast(d_positions.data()),
-      thrust::raw_pointer_cast(d_is_fixed.data()),
-      thrust::raw_pointer_cast(d_exp_dist.data()),
+      d_positions_ptr,
+      d_is_fixed_ptr,
+      d_exp_dist_ptr,
       n,
-      thrust::raw_pointer_cast(d_loop_pairs.data()),
-      thrust::raw_pointer_cast(d_loop_params.data()),
+      d_loop_pairs_ptr,
+      d_loop_params_ptr,
       n_loops,
       gpu_settings,
       step_size,
-      thrust::raw_pointer_cast(d_best_score.data()),
-      thrust::raw_pointer_cast(d_best_positions.data()),
+      d_best_score_ptr,
+      d_best_pos_ptr,
       d_isDone);
 
   gpuErrchkArcs(cudaPeekAtLastError());
-  gpuErrchkArcs(cudaDeviceSynchronize());
 
   /* ------------------------------------------------------------------
    * Find the warp with the best (lowest) score.
    * ------------------------------------------------------------------ */
-  thrust::host_vector<float>  h_best_score    = d_best_score;
-  thrust::host_vector<float3> h_best_positions = d_best_positions;
+  std::vector<float> h_best_score(n_warps);
+  cudaMemcpy(h_best_score.data(), d_best_score_ptr,
+             n_warps * sizeof(float), cudaMemcpyDeviceToHost);
 
   int best_warp   = 0;
   float best_sc   = h_best_score[0];
@@ -738,12 +819,16 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
 
   /* ------------------------------------------------------------------
    * Write back best positions to CPU clusters array.
+   * Copy only the best warp's positions (n float3s starting at offset).
    * ------------------------------------------------------------------ */
+  std::vector<float3> h_best_positions(n);
+  cudaMemcpy(h_best_positions.data(),
+             d_best_pos_ptr + (size_t)best_warp * n,
+             n * sizeof(float3), cudaMemcpyDeviceToHost);
   for (int i = 0; i < n; ++i) {
-    float3 p = h_best_positions[(size_t)best_warp * n + i];
-    clusters[active_region[i]].pos.x = p.x;
-    clusters[active_region[i]].pos.y = p.y;
-    clusters[active_region[i]].pos.z = p.z;
+    clusters[active_region[i]].pos.x = h_best_positions[i].x;
+    clusters[active_region[i]].pos.y = h_best_positions[i].y;
+    clusters[active_region[i]].pos.z = h_best_positions[i].z;
   }
 
   /* ------------------------------------------------------------------
@@ -753,21 +838,11 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
   cudaMemcpyFromSymbol(&gpu_iters, d_arcs_total_iterations, sizeof(int));
   total_mc_steps += gpu_iters;
 
-  /* ------------------------------------------------------------------
-   * Recompute final score on CPU for accuracy (matches return type of
-   * MonteCarloArcs).
-   * ------------------------------------------------------------------ */
-  double score_final =
-      calcScoreDistancesActiveRegion() + calcScoreLoopEnergy();
+  /* Use GPU-computed best score directly to avoid O(n²) CPU recomputation.
+   * The score is only used for best-structure selection (steps is typically 1). */
+  float score_final = best_sc;
 
-  printf("[GPU Arcs] FINAL SCORE = %f  (best warp=%d, GPU iters=%d)\n",
-         (float)score_final, best_warp, gpu_iters);
-
-  /* ------------------------------------------------------------------
-   * Cleanup.
-   * ------------------------------------------------------------------ */
-  cudaFree(d_isDone);
-  cudaFree(d_states);
+  /* No per-call cleanup — curandState and isDone are cached in gpu_cache. */
 
   return static_cast<float>(score_final);
 }

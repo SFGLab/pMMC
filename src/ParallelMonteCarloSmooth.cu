@@ -315,7 +315,8 @@ __global__ void MonteCarloSmoothKernel(
 
   /* ---- main SA loop ---- */
 #define INNER_STEPS 256
-  while (true) {
+  const int max_smooth_iters = s.MCstopConditionStepsSmooth;
+  while (iterations < max_smooth_iters) {
 
 #pragma unroll 4
     for (int inner = 0; inner < INNER_STEPS; ++inner) {
@@ -409,9 +410,6 @@ __global__ void MonteCarloSmoothKernel(
         float full_energy = calcFullEnergySmooth(positions, dist_to_next,
                                                   is_fixed, active_n, s);
 
-        printf("[SmoothGPU] milestone: score=%f prev=%f T=%f successes=%d\n",
-               full_energy, milestone_score, T, milestone_successes);
-
         bool score_flat =
             (full_energy >= s.MCstopConditionImprovementSmooth * milestone_score);
         bool few_successes =
@@ -460,29 +458,16 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
   if (active_n <= 2)
     return 0.0f;   /* nothing to optimise */
 
-  /* ---- CUDA grid geometry ----
-   * We want at least one warp (32 threads) per block.
-   * Use cudaThreadsPerBlock but clamp to a warp boundary; then apply the
-   * cudaBlocksMultiplier.  Fewer blocks than the heatmap kernel are needed
-   * because the smooth kernel is lighter (local energy only). */
-  const int threads_per_block = 32;   /* exactly one warp per block */
-  int blocks = Settings::cudaBlocksMultiplier *
-               static_cast<int>((active_n + 3) / 4);
-  if (blocks < 1) blocks = 1;
-
-  /* Cap curandState allocation at 256 MB */
-  {
-    size_t state_bytes   = (size_t)threads_per_block * blocks * sizeof(curandState);
-    size_t max_state_bytes = 256ULL * 1024 * 1024;
-    if (state_bytes > max_state_bytes) {
-      int max_blocks = (int)(max_state_bytes /
-                             ((size_t)threads_per_block * sizeof(curandState)));
-      printf("[GPU] SmoothKernel: capping blocks %d -> %d "
-             "(curandState would use %zu MB)\n",
-             blocks, max_blocks, state_bytes / (1024 * 1024));
-      blocks = max_blocks;
-    }
+  /* ---- CUDA grid geometry using cached device properties ---- */
+  if (!gpu_cache.initialized) {
+    gpu_cache.init();
+    if (!gpu_cache.initialized)
+      return static_cast<float>(MonteCarloArcsSmooth(step_size, false));
   }
+
+  const int threads_per_block = 32;   /* exactly one warp per block */
+  int blocks = gpu_cache.sm_count * 2; /* 2 warps per SM */
+  if (blocks < 1) blocks = 1;
 
   printf("[GPU] MC Smooth: threads=%d, blocks=%d, active_n=%d, "
          "curandState=%.1f MB\n",
@@ -490,36 +475,46 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
          (float)threads_per_block * blocks * sizeof(curandState) /
              (1024.0f * 1024.0f));
 
-  /* ---- Build host-side flat arrays ---- */
-  thrust::host_vector<float3> h_positions(active_n);
-  thrust::host_vector<bool>   h_fixed(active_n);
-  thrust::host_vector<float>  h_dist(active_n);   /* dist_to_next[i] */
+  /* ---- Ensure pre-allocated device buffers are large enough ---- */
+  gpu_cache.initSmoothBuffers(active_n);
+
+  /* ---- Build host-side flat arrays and upload via cached buffers ---- */
+  std::vector<float3> h_positions(active_n);
+  std::vector<char>   h_fixed(active_n);  // char instead of bool (vector<bool> has no .data())
+  std::vector<float>  h_dist(active_n);
 
   for (int i = 0; i < active_n; ++i) {
     int ci = active_region[i];
     h_positions[i].x = clusters[ci].pos.x;
     h_positions[i].y = clusters[ci].pos.y;
     h_positions[i].z = clusters[ci].pos.z;
-    h_fixed[i]       = clusters[ci].is_fixed;
+    h_fixed[i]       = clusters[ci].is_fixed ? 1 : 0;
     h_dist[i]        = static_cast<float>(clusters[ci].dist_to_next);
   }
 
-  /* ---- Copy to device ---- */
-  thrust::device_vector<float3> d_positions  = h_positions;
-  thrust::device_vector<bool>   d_fixed      = h_fixed;
-  thrust::device_vector<float>  d_dist       = h_dist;
+  float3 *d_positions_ptr = static_cast<float3 *>(gpu_cache.d_smooth_positions);
+  bool   *d_fixed_ptr     = static_cast<bool *>(gpu_cache.d_smooth_fixed);
+  float  *d_dist_ptr      = static_cast<float *>(gpu_cache.d_smooth_dist);
 
-  bool *d_isDone;
-  gpuErrchkSmooth(cudaMalloc((void **)&d_isDone, sizeof(bool)));
+  cudaMemcpy(d_positions_ptr, h_positions.data(),
+             active_n * sizeof(float3), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_fixed_ptr, h_fixed.data(),
+             active_n * sizeof(bool), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_dist_ptr, h_dist.data(),
+             active_n * sizeof(float), cudaMemcpyHostToDevice);
+
+  /* Use cached isDone flag and curandState — avoids per-call cudaMalloc. */
+  bool *d_isDone = static_cast<bool *>(gpu_cache.d_smooth_isDone);
   gpuErrchkSmooth(cudaMemset(d_isDone, 0, sizeof(bool)));
 
-  /* ---- RNG states ---- */
-  curandState *d_states;
-  gpuErrchkSmooth(cudaMalloc((void **)&d_states,
-                              (size_t)threads_per_block * blocks *
-                              sizeof(curandState)));
-  setupSmoothKernel<<<blocks, threads_per_block>>>(d_states, seed);
-  gpuErrchkSmooth(cudaDeviceSynchronize());
+  curandState *d_states = static_cast<curandState *>(gpu_cache.d_smooth_states);
+
+  /* Seed RNG only once (first call), then reuse across all blocks. */
+  if (!gpu_cache.smooth_states_seeded) {
+    setupSmoothKernel<<<blocks, threads_per_block>>>(d_states, seed);
+    gpuErrchkSmooth(cudaDeviceSynchronize());
+    gpu_cache.smooth_states_seeded = true;
+  }
 
   /* ---- Pack settings ---- */
   smooth_gpu_settings s;
@@ -542,9 +537,9 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
   /* ---- Launch kernel ---- */
   MonteCarloSmoothKernel<<<blocks, threads_per_block>>>(
       d_states,
-      thrust::raw_pointer_cast(d_positions.data()),
-      thrust::raw_pointer_cast(d_fixed.data()),
-      thrust::raw_pointer_cast(d_dist.data()),
+      d_positions_ptr,
+      d_fixed_ptr,
+      d_dist_ptr,
       T_init,
       step_size,
       active_n,
@@ -552,13 +547,13 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
       d_isDone);
 
   gpuErrchkSmooth(cudaPeekAtLastError());
-  gpuErrchkSmooth(cudaDeviceSynchronize());
+  /* cudaMemcpy(D→H) below will implicitly synchronize. */
 
   /* ---- Copy positions back ---- */
-  h_positions = d_positions;
+  cudaMemcpy(h_positions.data(), d_positions_ptr,
+             active_n * sizeof(float3), cudaMemcpyDeviceToHost);
   for (int i = 0; i < active_n; ++i) {
-    /* Only update non-fixed beads — fixed anchors must not move */
-    if (!h_fixed[i]) {
+    if (h_fixed[i] == 0) {
       clusters[active_region[i]].pos.x = h_positions[i].x;
       clusters[active_region[i]].pos.y = h_positions[i].y;
       clusters[active_region[i]].pos.z = h_positions[i].z;
@@ -577,9 +572,7 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
   printf("SMOOTH FINAL SCORE IS %f (GPU iterations: %d)\n",
          final_score, gpu_iters);
 
-  /* ---- Cleanup ---- */
-  cudaFree(d_isDone);
-  cudaFree(d_states);
+  /* No per-call cleanup — curandState and isDone are cached in gpu_cache. */
 
   return static_cast<float>(final_score);
 }

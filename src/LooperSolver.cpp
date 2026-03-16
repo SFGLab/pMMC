@@ -1,5 +1,6 @@
 #include <LooperSolver.h>
 #include <MdsInitializer.h>
+#include <MultiscaleEnergy.h>
 #include <platform.h>
 
 LooperSolver::LooperSolver(string label, string outdir) {
@@ -11,6 +12,8 @@ LooperSolver::LooperSolver(string label, string outdir) {
   zero_distance = true;
   tmp_var = 0;
   total_mc_steps = 0;
+
+  energy.initStandardTerms();
 
   setDebuggingOptions(); // use default values (ie. disable debug options)
 
@@ -443,8 +446,19 @@ void LooperSolver::reconstructClustersHeatmapSingleLevel(int level) {
     density_curr.toFile(ftext("%sdensity_norm.txt", output_dir.c_str()));
   }
 
-  // for (size_t i = 0; i < active_region.size(); ++i)
-  // print_vector(clusters[active_region[i]].pos, ftext("p_%d: ", i).c_str());
+  // Update domain-scale energy tracking
+  {
+    EnergyTerm *ht = energy.domain_scale.getTerm("heatmap_fit");
+    if (ht) ht->update(best_score);
+    if (Settings::useDensity) {
+      EnergyTerm *dt = energy.domain_scale.getTerm("density_fit");
+      if (dt) dt->update(calcScoreDensity());
+    }
+    if (Settings::outputLevel >= 2) {
+      output(2, "[MultiscaleEnergy] domain scale (level %d): heatmap=%.4f\n",
+             level, best_score);
+    }
+  }
 }
 
 double LooperSolver::MonteCarloHeatmap(float step_size) {
@@ -478,6 +492,10 @@ double LooperSolver::MonteCarloHeatmap(float step_size) {
   milestone_score = score_curr;
 
   output(2, "initial score: %lf (density=%lf)\n", score_curr, score_density);
+
+  // Guard: skip MC if heatmap score is NaN (empty heatmap at this level)
+  if (score_curr != score_curr || score_curr < 1e-6)
+    return 0.0;
 
   int milestone_cnt = 0;
 
@@ -597,6 +615,10 @@ double LooperSolver::MonteCarloHeatmapAndDensity(float step_size) {
   output(2, "initial score: %lf (heat=%lf, density=%lf); step=%f, steps=%d\n",
          score_curr, score_heatmap, score_density, step_size,
          Settings::MCstopConditionStepsHeatmapDensity);
+
+  // Guard: skip MC if score is NaN (empty heatmap at this level)
+  if (score_curr != score_curr || score_curr < 1e-6)
+    return 0.0;
 
   int milestone_cnt = 0;
 
@@ -1525,8 +1547,17 @@ Heatmap LooperSolver::createSingletonHeatmap(int diag) {
     breaks[chr][0] = chr_min_pos[chr];
     breaks[chr][breaks[chr].size() - 1] = chr_max_pos[chr];
 
-    if (chr_min_pos[chr] == max_position)
-      error("no singletons found for chromosome");
+    if (chr_min_pos[chr] == max_position) {
+      printf("WARNING: no singletons mapped for %s at this level, using genomic bounds\n", chr.c_str());
+      // Use cluster genomic bounds as fallback
+      if (!current_level[chr].empty()) {
+        chr_min_pos[chr] = clusters[current_level[chr].front()].start;
+        chr_max_pos[chr] = clusters[current_level[chr].back()].end;
+      } else {
+        chr_min_pos[chr] = 0;
+        chr_max_pos[chr] = 1;
+      }
+    }
   }
 
   // calculate lengths of bins (ie. genomic span)
@@ -2739,6 +2770,10 @@ void LooperSolver::reconstructClustersArcsDistances() {
 
   setLevel(LVL_SEGMENT); // set segment level
 
+  /* Initialize persistent GPU resources before the block loop to avoid
+   * per-block cudaMalloc/cudaFree overhead for curandState and flags. */
+  gpu_cache.init();
+
   int curr_size = 0;
   int ii = 0;
   for (string chr : chrs) {
@@ -2877,6 +2912,15 @@ void LooperSolver::reconstructClustersArcsDistances() {
       // exit(0);
       // getSnapshot(ftext("cluster_%d,_smoothed", i));
     }
+  }
+
+  // Print multiscale energy decomposition at end of arc reconstruction
+  if (Settings::outputLevel >= 2) {
+    energy.printDecomposition();
+    std::string energy_path = ftext("%senergy_decomposition_%s.csv",
+                                     output_dir.c_str(), label.c_str());
+    energy.writeDecomposition(energy_path);
+    output(1, "[MultiscaleEnergy] Written to %s\n", energy_path.c_str());
   }
 }
 
@@ -3032,16 +3076,20 @@ void LooperSolver::reconstructClusterArcsDistances(int cluster, int cluster_ind,
     //}
     // else
 
-    // Try GPU path first (G1); falls back to CPU internally if no GPU
+    // Try GPU path for large active regions; use CPU for small ones.
+    // GPU kernel launch overhead dominates for small problems (n < 16).
     if (smooth) {
-      if (active_size >= 64 && !use_subanchor_heatmap) {
-        // GPU smooth path (skip CTCF orientation on GPU, skip subanchor heatmap)
+      if (active_size >= 4 && !use_subanchor_heatmap) {
         score = ParallelMonteCarloSmooth(noise_size, Settings::gpuSeed);
       } else {
         score = MonteCarloArcsSmooth(noise_size, use_subanchor_heatmap);
       }
     } else {
-      score = parallelMonteCarloArcs(noise_size);
+      if (active_size >= 2) {
+        score = parallelMonteCarloArcs(noise_size);
+      } else {
+        score = MonteCarloArcs(noise_size);
+      }
     }
 
     output(3, "score = %lf, best = %lf\n", score, best_score);
@@ -3059,6 +3107,25 @@ void LooperSolver::reconstructClusterArcsDistances(int cluster, int cluster_ind,
   // restore best structure
   for (size_t i = 0; i < active_size; ++i)
     clusters[active_region[i]].pos = best_structure[i];
+
+  // Update loop-scale energy tracking
+  {
+    if (smooth) {
+      EnergyTerm *st = energy.loop_scale.getTerm("linker_stretch");
+      if (st) st->update(calcScoreStructureSmooth(true, false));
+      EnergyTerm *at = energy.loop_scale.getTerm("angular_bending");
+      if (at) at->update(calcScoreStructureSmooth(false, true));
+    } else {
+      EnergyTerm *ad = energy.loop_scale.getTerm("arc_distance");
+      if (ad) ad->update(calcScoreDistancesActiveRegion());
+      EnergyTerm *ls = energy.loop_scale.getTerm("linker_stretch");
+      if (ls) ls->update(calcScoreStructureActiveRegionLengths());
+    }
+    if (Settings::outputLevel >= 3) {
+      output(3, "[MultiscaleEnergy] loop scale (smooth=%d): best=%.4f\n",
+             smooth, best_score);
+    }
+  }
 }
 
 void LooperSolver::interpolateChildrenPosition(std::vector<int> &regions) {

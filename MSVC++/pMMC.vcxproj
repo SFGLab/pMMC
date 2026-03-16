@@ -34,7 +34,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 12.0.props" />
+    <Import Project="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.props" />
   </ImportGroup>
   <!-- Common property overrides -->
   <PropertyGroup>
@@ -115,6 +115,10 @@
     <ClCompile Include="..\src\CifWriter.cpp" />
     <ClCompile Include="..\src\PdbWriter.cpp" />
     <ClCompile Include="..\src\MdsInitializer.cpp" />
+    <ClCompile Include="..\src\MultiscaleEnergy.cpp" />
+    <ClCompile Include="..\src\GenomeReconstructor.cpp" />
+    <ClCompile Include="..\src\IbedFileIO.cpp" />
+    <ClCompile Include="..\src\MergedFileIO.cpp" />
     <ClCompile Include="..\thirdparty\common.cpp" />
     <ClCompile Include="..\thirdparty\INIReader.cpp" />
     <ClCompile Include="..\thirdparty\mtxlib.cpp" />
@@ -154,6 +158,10 @@
     <ClInclude Include="..\include\CifWriter.h" />
     <ClInclude Include="..\include\PdbWriter.h" />
     <ClInclude Include="..\include\MdsInitializer.h" />
+    <ClInclude Include="..\include\MultiscaleEnergy.h" />
+    <ClInclude Include="..\include\GenomeReconstructor.h" />
+    <ClInclude Include="..\include\IbedFileIO.h" />
+    <ClInclude Include="..\include\MergedFileIO.h" />
     <ClInclude Include="..\thirdparty\common.h" />
     <ClInclude Include="..\thirdparty\getopt.h" />
     <ClInclude Include="..\thirdparty\ini.h" />
@@ -163,6 +171,6 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 12.0.targets" />
+    <Import Project="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.targets" />
   </ImportGroup>
 </Project>

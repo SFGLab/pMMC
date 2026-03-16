@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string>
 #include <time.h>
+#include <vector>
 
 #include <platform.h>
 
@@ -21,16 +22,21 @@ std::atomic<bool> g_cancel_requested(false);
 #include <BenchmarkRunner.h>
 #include <CifWriter.h>
 #include <DistanceMapGenerator.h>
+#include <GenomeReconstructor.h>
 #include <HierarchicalChromosome.h>
 #include <LooperSolver.h>
+#include <IbedFileIO.h>
+#include <MergedFileIO.h>
 #include <MetricsFramework.h>
 #include <MultiscaleEnergy.h>
 #include <PdbWriter.h>
 #include <SimulationLogger.h>
 #include <SyntheticGenerator.h>
+#include <HeatmapImageWriter.h>
 #include <common.h>
 
 std::map<char, std::string> args;
+std::string g_output_format;  // Saved from -F flag before args.clear()
 
 void usage(const char *act = "", bool quit = true) {
   printf("Usage: pMMC -a <action> [options]\n\n");
@@ -47,6 +53,9 @@ void usage(const char *act = "", bool quit = true) {
   printf("  distance (d)   Compute distance matrix from .hcm file\n");
   printf("  flatten (f)    Flatten hierarchical structure to text\n");
   printf("  rewiring (w)   Rewiring analysis\n");
+  printf("  merge (M)      Merge BED + BEDPE into a single merged file\n");
+  printf("  simulate (S)   Reconstruct from merged file\n");
+  printf("  ibed (I)       Reconstruct from .ibed file\n");
   printf("\nCommon options:\n");
   printf("  -a  action to perform\n");
   printf("  -s  path to settings file\n");
@@ -65,6 +74,9 @@ void usage(const char *act = "", bool quit = true) {
   printf("  -M  max memory budget in MB (0 = unlimited, default: 0)\n");
   printf("\nInitialization:\n");
   printf("  -I  initialization method: random (default), mds\n");
+  printf("\nMerge/Simulate options:\n");
+  printf("  -B  BED file path (for merge action)\n");
+  printf("  -P  BEDPE file path (for merge action)\n");
   printf("\nDebugging:\n");
   printf("  -u  max chromosomes to reconstruct\n");
 
@@ -92,7 +104,8 @@ string get_arg(char c, string _default = "") {
 // Always saves HCM (backward compat). Additionally saves CIF/PDB if -F flag requests it.
 void saveModelWithFormat(HierarchicalChromosome &hc, const string &outdir,
                          const string &label, bool use_new_file_format,
-                         const string &suffix = "") {
+                         const string &suffix = "",
+                         bool useCurrentLevel = false) {
   // Always save HCM
   string hcm_path;
   if (use_new_file_format)
@@ -105,19 +118,19 @@ void saveModelWithFormat(HierarchicalChromosome &hc, const string &outdir,
   else
     hc.toFilePreviousFormat(hcm_path);
 
-  // Check -F flag for additional formats
-  if (flag_set('F')) {
-    string fmt = get_arg('F');
+  // Write additional formats (CIF/PDB) based on -F flag saved before args.clear()
+  if (!g_output_format.empty()) {
     string base = ftext("%s%s%s", outdir.c_str(), label.c_str(), suffix.c_str());
-    if (fmt == "cif" || fmt == "mmcif") {
-      CifWriter::write(hc, base + ".cif");
-    } else if (fmt == "pdb") {
-      PdbWriter::write(hc, base + ".pdb");
-    } else if (fmt == "both") {
-      CifWriter::write(hc, base + ".cif");
-      PdbWriter::write(hc, base + ".pdb");
+    if (g_output_format == "cif" || g_output_format == "mmcif") {
+      CifWriter::write(hc, base + ".cif", "cudaMMC", useCurrentLevel);
+    } else if (g_output_format == "pdb") {
+      // PDB always uses lowest level for maximum atom detail
+      PdbWriter::write(hc, base + ".pdb", false);
+    } else if (g_output_format == "both") {
+      CifWriter::write(hc, base + ".cif", "cudaMMC", useCurrentLevel);
+      PdbWriter::write(hc, base + ".pdb", false);
     } else {
-      printf("[WARN] Unknown output format '%s'. Use: cif, pdb, or both\n", fmt.c_str());
+      printf("[WARN] Unknown output format '%s'. Use: cif, pdb, or both\n", g_output_format.c_str());
     }
   }
 }
@@ -510,6 +523,183 @@ std::vector<std::string> parseChromosomeDescription(string desc) {
   return ret;
 }
 
+// ---------------------------------------------------------------------------
+// Output validation: create ERROR_WARNING.txt only when serious issues exist
+// ---------------------------------------------------------------------------
+
+// Return file size in bytes, or -1 if the file cannot be opened.
+static long getFileSize(const std::string &path) {
+  FILE *f = fopen(path.c_str(), "rb");
+  if (!f) return -1;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fclose(f);
+  return sz;
+}
+
+// Validate expected output files and write ERROR_WARNING.txt only if serious
+// issues are found (missing or empty output files).  If everything is fine,
+// remove any stale ERROR_WARNING.txt left over from a previous run.
+void validateOutputsAndWriteErrorWarning(const std::string &outdir,
+                                         const std::string &label,
+                                         bool use_new_file_format,
+                                         int ensemble_size) {
+  std::string ew_path = outdir + "ERROR_WARNING.txt";
+  std::vector<std::string> missing_files;
+  std::vector<std::string> empty_files;
+
+  // Helper: check one candidate file.  If it exists and is empty, record it.
+  // If it does not exist, record it.
+  auto checkFile = [&](const std::string &path, const std::string &desc) {
+    long sz = getFileSize(path);
+    if (sz < 0) {
+      missing_files.push_back(desc + " (" + path + ")");
+    } else if (sz == 0) {
+      empty_files.push_back(desc + " (" + path + ")");
+    }
+  };
+
+  // Helper: check a file that has two possible names (old vs new format).
+  // At least one of the two should exist and be non-empty.
+  auto checkFileEither = [&](const std::string &pathA,
+                             const std::string &pathB,
+                             const std::string &desc) {
+    long szA = getFileSize(pathA);
+    long szB = getFileSize(pathB);
+    bool a_ok = (szA > 0);
+    bool b_ok = (szB > 0);
+    if (a_ok || b_ok) return;  // at least one is fine
+    // Both are problematic.  Report the one that exists-but-empty, or missing.
+    if (szA == 0) {
+      empty_files.push_back(desc + " (" + pathA + ")");
+    } else if (szB == 0) {
+      empty_files.push_back(desc + " (" + pathB + ")");
+    } else {
+      missing_files.push_back(desc + " (" + pathA + " or " + pathB + ")");
+    }
+  };
+
+  if (ensemble_size <= 1) {
+    // --- Single-run expected outputs ---
+    // Final HCM
+    {
+      std::string hcmA = ftext("%sloops_%s.hcm", outdir.c_str(), label.c_str());
+      std::string hcmB = ftext("%sloops_new_%s.hcm", outdir.c_str(), label.c_str());
+      checkFileEither(hcmA, hcmB, "Final HCM");
+    }
+    // Final PDB
+    {
+      std::string pdb = ftext("%s%s.pdb", outdir.c_str(), label.c_str());
+      checkFile(pdb, "Final PDB");
+    }
+    // Initial HCM
+    {
+      std::string hcmA = ftext("%sloops_%s_initial.hcm", outdir.c_str(), label.c_str());
+      std::string hcmB = ftext("%sloops_new_%s_initial.hcm", outdir.c_str(), label.c_str());
+      checkFileEither(hcmA, hcmB, "Initial HCM");
+    }
+    // Initial PDB
+    {
+      std::string pdb = ftext("%s%s_initial.pdb", outdir.c_str(), label.c_str());
+      checkFile(pdb, "Initial PDB");
+    }
+  } else {
+    // --- Ensemble expected outputs ---
+    for (int i = 0; i < ensemble_size; ++i) {
+      std::string idx = ftext("_%d", i);
+      // Final HCM
+      {
+        std::string hcmA = ftext("%sloops_%s%s.hcm", outdir.c_str(), label.c_str(), idx.c_str());
+        std::string hcmB = ftext("%sloops_new_%s%s.hcm", outdir.c_str(), label.c_str(), idx.c_str());
+        checkFileEither(hcmA, hcmB, ftext("Ensemble %d final HCM", i));
+      }
+      // Final PDB
+      {
+        std::string pdb = ftext("%s%s%s.pdb", outdir.c_str(), label.c_str(), idx.c_str());
+        checkFile(pdb, ftext("Ensemble %d final PDB", i));
+      }
+      // Initial HCM
+      {
+        std::string ini_suffix = ftext("_%d_initial", i);
+        std::string hcmA = ftext("%sloops_%s%s.hcm", outdir.c_str(), label.c_str(), ini_suffix.c_str());
+        std::string hcmB = ftext("%sloops_new_%s%s.hcm", outdir.c_str(), label.c_str(), ini_suffix.c_str());
+        checkFileEither(hcmA, hcmB, ftext("Ensemble %d initial HCM", i));
+      }
+      // Initial PDB
+      {
+        std::string pdb = ftext("%s%s_%d_initial.pdb", outdir.c_str(), label.c_str(), i);
+        checkFile(pdb, ftext("Ensemble %d initial PDB", i));
+      }
+    }
+  }
+
+  // Check .heat files: look for the known suffixes
+  {
+    std::vector<std::string> heat_suffixes = {
+      "singletons_chromosomes_", "singletons_segment_",
+      "singletons_chromosomes_norm_", "singletons_segment_norm_",
+      "heat_dist_chromosomes_", "heat_dist_segment_"
+    };
+    for (const auto &suffix : heat_suffixes) {
+      std::string heat_path = ftext("%s%s%s.heat", outdir.c_str(), suffix.c_str(), label.c_str());
+      long sz = getFileSize(heat_path);
+      // Only flag if the file exists but is empty.
+      // Heat files are optional — not all runs produce all of them —
+      // so a missing heat file is NOT an error.
+      if (sz == 0) {
+        empty_files.push_back("Heatmap file (" + heat_path + ")");
+      }
+    }
+  }
+
+  // --- Decision: create ERROR_WARNING.txt only if there are genuine issues ---
+  bool has_issues = !missing_files.empty() || !empty_files.empty();
+
+  if (!has_issues) {
+    // No problems — remove stale ERROR_WARNING.txt from a previous run
+    ::remove(ew_path.c_str());
+    return;
+  }
+
+  // Write ERROR_WARNING.txt
+  FILE *f = fopen(ew_path.c_str(), "w");
+  if (!f) {
+    printf("[WARN] Could not create %s\n", ew_path.c_str());
+    return;
+  }
+
+  fprintf(f, "ERROR / WARNING REPORT\n");
+  fprintf(f, "======================\n\n");
+  fprintf(f, "One or more expected output files are missing or empty.\n");
+  fprintf(f, "The 3D reconstruction output may be incomplete or unusable.\n\n");
+
+  if (!missing_files.empty()) {
+    fprintf(f, "MISSING FILES (expected but not found):\n");
+    for (const auto &m : missing_files) {
+      fprintf(f, "  - %s\n", m.c_str());
+    }
+    fprintf(f, "\n  Possible causes: the reconstruction failed or was cancelled\n");
+    fprintf(f, "  before these files could be written, the output directory is\n");
+    fprintf(f, "  not writable, or insufficient disk space.\n\n");
+  }
+
+  if (!empty_files.empty()) {
+    fprintf(f, "EMPTY FILES (exist but contain 0 bytes):\n");
+    for (const auto &e : empty_files) {
+      fprintf(f, "  - %s\n", e.c_str());
+    }
+    fprintf(f, "\n  Possible causes: the file was created but the write failed\n");
+    fprintf(f, "  (disk full, I/O error), or the input data produced a\n");
+    fprintf(f, "  degenerate structure with no content to write.\n\n");
+  }
+
+  fprintf(f, "These issues seriously affect output quality.  Please check\n");
+  fprintf(f, "the log output above for additional error messages.\n");
+  fclose(f);
+
+  printf("[WARN] Wrote %s — output validation found issues.\n", ew_path.c_str());
+}
+
 // ensemble_mode - whether to create 1 structure or a whole ensemble. accepted
 // values:
 //	   -1 - single structure
@@ -627,6 +817,19 @@ void runLooper(std::vector<string> chrs, BedRegion region_of_interest,
     printf("[TIMING] Heatmap phase: %.1f ms\n", heatmap_ms);
     logMemoryUsage("after reconstructClustersHeatmap");
 
+    // Always save initial conformation (HCM + PDB) for reproducibility.
+    {
+        printf("save initial conformation\n");
+        HierarchicalChromosome hc_initial = lsm.getModel();
+        // HCM: save at current level (preserves segment-level view)
+        saveModelWithFormat(hc_initial, outdir, label, use_new_file_format, "_initial", true);
+        // PDB: always write using lowest level for maximum atom detail
+        if (g_output_format != "pdb" && g_output_format != "both") {
+            std::string pdb_path = ftext("%s%s_initial.pdb", outdir.c_str(), label.c_str());
+            PdbWriter::write(hc_initial, pdb_path, false);
+        }
+    }
+
     if (max_level >= LVL_INTERACTION_BLOCK) {
       printf("reconstruct arcs\n");
       auto t_arcs_start = chrono::high_resolution_clock::now();
@@ -637,6 +840,9 @@ void runLooper(std::vector<string> chrs, BedRegion region_of_interest,
       logMemoryUsage("after reconstructClustersArcsDistances");
     }
 
+    // Print final multiscale energy decomposition
+    lsm.energy.printDecomposition();
+
     printf("save\n");
     HierarchicalChromosome hc = lsm.getModel();
 
@@ -646,6 +852,12 @@ void runLooper(std::vector<string> chrs, BedRegion region_of_interest,
     lsm.showCoordinatesRange(1);
 
     saveModelWithFormat(hc, outdir, label, use_new_file_format);
+
+    // Always ensure PDB is written for final conformation (R2.1)
+    if (g_output_format != "pdb" && g_output_format != "both") {
+        std::string pdb_path = ftext("%s%s.pdb", outdir.c_str(), label.c_str());
+        PdbWriter::write(hc, pdb_path);
+    }
   } else if (ensemble_size > 1) {
     // generate N independent structures
     printf("\nreconstruct %d structures\n", ensemble_size);
@@ -673,6 +885,21 @@ void runLooper(std::vector<string> chrs, BedRegion region_of_interest,
       printf("reconstruct heatmap\n");
       lsm.reconstructClustersHeatmap();
 
+      // Always save initial conformation (HCM + PDB) before arc reconstruction.
+      {
+          printf("save initial conformation %d/%d\n", i + 1, ensemble_size);
+          HierarchicalChromosome hc_initial = lsm.getModel();
+          std::string ens_suffix = ftext("_%d_initial", i);
+          saveModelWithFormat(hc_initial, outdir, label, use_new_file_format,
+                              ens_suffix, true);
+          // Ensure PDB is always written for initial conformation, even if -F
+          // flag was not set to "pdb" or "both".
+          if (g_output_format != "pdb" && g_output_format != "both") {
+              std::string pdb_path = ftext("%s%s%s.pdb", outdir.c_str(), label.c_str(), ens_suffix.c_str());
+              PdbWriter::write(hc_initial, pdb_path, false);
+          }
+      }
+
       if (max_level >= LVL_INTERACTION_BLOCK) {
         printf("reconstruct arcs\n");
         lsm.reconstructClustersArcsDistances();
@@ -684,6 +911,12 @@ void runLooper(std::vector<string> chrs, BedRegion region_of_interest,
       saveModelWithFormat(hc, outdir, label, use_new_file_format,
                           ftext("_%d", i));
 
+      // Always ensure PDB is written for ensemble final conformation (R2.1)
+      if (g_output_format != "pdb" && g_output_format != "both") {
+          std::string pdb_path = ftext("%s%s_%d.pdb", outdir.c_str(), label.c_str(), i);
+          PdbWriter::write(hc, pdb_path);
+      }
+
       // remove subanchor beads
       lsm.removeSubanchorBeads();
       lsm.reset();
@@ -691,10 +924,36 @@ void runLooper(std::vector<string> chrs, BedRegion region_of_interest,
   } else
     error("ensemble size not correct");
 
+  // Generate heatmap images from .heat files (R4.2, R4.3)
+  {
+    std::vector<std::string> heat_suffixes = {
+        "singletons_chromosomes_", "singletons_segment_",
+        "singletons_chromosomes_norm_", "singletons_segment_norm_",
+        "heat_dist_chromosomes_", "heat_dist_segment_"
+    };
+    for (const auto& suffix : heat_suffixes) {
+      std::string heat_path = ftext("%s%s%s.heat", outdir.c_str(), suffix.c_str(), label.c_str());
+      if (file_exists(heat_path)) {
+        Heatmap h;
+        h.fromFile(heat_path);
+        if (h.size > 0) {
+          std::string base = heat_path.substr(0, heat_path.size() - 5); // remove .heat
+          std::string title = suffix + label;
+          HeatmapImageWriter::writePNG(h, base + ".png", title);
+          HeatmapImageWriter::writeSVG(h, base + ".svg", title);
+        }
+      }
+    }
+  }
+
   // Transfer accumulated MC step count to the logger
   if (logger)
     logger->setTotalSteps(lsm.total_mc_steps);
   printf("Total MC steps accumulated: %d\n", lsm.total_mc_steps);
+
+  // Validate outputs and create ERROR_WARNING.txt only if serious issues exist
+  validateOutputsAndWriteErrorWarning(outdir, label, use_new_file_format,
+                                      ensemble_size);
 }
 
 void prepareLooper(SimulationLogger *logger = nullptr) {
@@ -804,6 +1063,9 @@ void prepareLooper(SimulationLogger *logger = nullptr) {
   bool ignore_cache = flag_set('h');
   if (ignore_cache)
     Settings::useInputCache = false;
+
+  // Save -F flag before args.clear() so saveModelWithFormat can use it
+  g_output_format = flag_set('F') ? get_arg('F') : "";
 
   args.clear(); // clean here, otherwise heap corruption occurs when program
                 // abnormally stops (i.e. exit(0))
@@ -954,6 +1216,267 @@ void prepareMetrics() {
   printf("Structural similarity (SCC): %.4f\n", scc);
 }
 
+void prepareMerge() {
+  if (!flag_set('B'))
+    error_msg("No BED file specified [-B]\n");
+  if (!flag_set('P'))
+    error_msg("No BEDPE file specified [-P]\n");
+  if (!flag_set('o'))
+    error_msg("No output file specified [-o]\n");
+
+  std::string bed_path = get_arg('B');
+  std::string bedpe_path = get_arg('P');
+  std::string output_path = get_arg('o');
+
+  printf("Merging BED [%s] + BEDPE [%s] -> [%s]\n",
+         bed_path.c_str(), bedpe_path.c_str(), output_path.c_str());
+
+  if (!MergedFileIO::writeMerged(bed_path, bedpe_path, output_path))
+    error_msg("Failed to create merged file\n");
+}
+
+void prepareSimulate() {
+  if (!flag_set('i'))
+    error_msg("No merged input file specified [-i]\n");
+  if (!flag_set('s'))
+    error_msg("No settings file specified [-s]\n");
+
+  std::string merged_path = get_arg('i');
+  std::string stg_path = get_arg('s');
+  std::string outdir = flag_set('o') ? get_arg('o') : "./";
+
+  // Load settings
+  Settings stg;
+  printf("Load settings from [%s]\n", stg_path.c_str());
+  stg.loadFromINI(stg_path);
+
+  // Apply CLI overrides
+  if (flag_set('M'))
+    Settings::maxMemoryMB = (size_t)atoi(get_arg('M').c_str());
+  if (flag_set('E'))
+    Settings::energyTraceEnabled = true;
+  if (flag_set('L'))
+    Settings::energyTraceInterval = atoi(get_arg('L').c_str());
+  if (flag_set('I'))
+    Settings::initMethod = get_arg('I');
+
+  // Read merged file
+  std::vector<MergedLoop> loops;
+  std::vector<MergedAnchor> anchors;
+  if (!MergedFileIO::readMerged(merged_path, loops, anchors))
+    error_msg("Failed to read merged file\n");
+
+  // Parse chromosomes from -c flag
+  std::vector<std::string> chrs;
+  std::string chromosomes = "genome";
+  BedRegion region_of_interest;
+
+  if (flag_set('c')) {
+    chromosomes = get_arg('c');
+    if (BedRegion::tryParse(chromosomes)) {
+      region_of_interest.parse(chromosomes);
+      chrs.push_back(region_of_interest.chr);
+    } else {
+      chrs = parseChromosomeDescription(chromosomes);
+    }
+    // Filter merged data by chromosome
+    MergedFileIO::filterByChromosomes(loops, anchors, chrs);
+  } else {
+    chrs = parseChromosomeDescription(chromosomes);
+  }
+
+  // Create temp directory for extracted files
+  std::string tmpdir = outdir + "simulate_tmp/";
+  portable_mkdir(outdir.c_str());
+  portable_mkdir(tmpdir.c_str());
+
+  // Write temp BED and BEDPE
+  std::string tmp_bed = tmpdir + "anchors.bed";
+  std::string tmp_bedpe = tmpdir + "clusters.bedpe";
+
+  MergedFileIO::writeBed(anchors, tmp_bed);
+  MergedFileIO::writeBedpe(loops, tmp_bedpe);
+
+  // Override Settings data paths to point to extracted files
+  Settings::dataDirectory = "";
+  Settings::dataAnchors = tmp_bed;
+  Settings::dataPetClusters = tmp_bedpe;
+  // Clear singletons since we only have loop data from merged file
+  Settings::dataSingletons = "";
+  Settings::dataSingletonsInter = "";
+  Settings::dataFactors = "merged";
+
+  std::string name = flag_set('n') ? get_arg('n') : "simulate";
+  bool use_new_file_format = flag_set('z');
+  int length_limit = flag_set('l') ? atoi(get_arg('l').c_str()) : -1;
+  int chr_number_limit = flag_set('u') ? atoi(get_arg('u').c_str()) : -1;
+  int max_level = flag_set('v') ? atoi(get_arg('v').c_str()) : 5;
+  int ensemble_size = flag_set('m') ? atoi(get_arg('m').c_str()) : 1;
+
+  // Save -F flag before args.clear()
+  g_output_format = flag_set('F') ? get_arg('F') : "";
+
+  // Create simulation logger
+  portable_mkdir(outdir.c_str());
+  unsigned int seed = 0;
+  if (flag_set('j'))
+    seed = (unsigned int)atoi(get_arg('j').c_str());
+  Settings::gpuSeed = seed;
+
+  SimulationLogger logger(outdir, name, seed);
+  logger.logParameter("merged_input", merged_path);
+  logger.logParameter("chromosomes", chromosomes);
+  logger.logMilestone("Starting simulate reconstruction");
+
+  args.clear();
+
+  runLooper(chrs, region_of_interest, name, outdir, use_new_file_format,
+            max_level, chr_number_limit, length_limit, ensemble_size,
+            std::vector<std::string>(), &logger);
+
+  // Run territory analysis on the result
+  {
+    std::string hcm_path = ftext("%sloops_%s.hcm", outdir.c_str(), name.c_str());
+    if (file_exists(hcm_path)) {
+      HierarchicalChromosome hc;
+      hc.fromFile(hcm_path);
+      GenomeReconstructor gr;
+      gr.analyze(hc, 1);
+      gr.writeReport(outdir, name);
+    }
+  }
+
+  // Final output validation (also called inside runLooper, but re-check after
+  // territory analysis in case post-processing introduced issues)
+  validateOutputsAndWriteErrorWarning(outdir, name, use_new_file_format,
+                                      ensemble_size);
+
+  logger.logMilestone("Simulate reconstruction complete");
+  logger.writeSummary();
+}
+
+void prepareIbed() {
+  if (!flag_set('i'))
+    error_msg("No ibed input file specified [-i]\n");
+  if (!flag_set('s'))
+    error_msg("No settings file specified [-s]\n");
+
+  std::string ibed_path = get_arg('i');
+  std::string stg_path = get_arg('s');
+  std::string outdir = flag_set('o') ? get_arg('o') : "./";
+
+  // Load settings
+  Settings stg;
+  printf("Load settings from [%s]\n", stg_path.c_str());
+  stg.loadFromINI(stg_path);
+
+  // Apply CLI overrides
+  if (flag_set('M'))
+    Settings::maxMemoryMB = (size_t)atoi(get_arg('M').c_str());
+  if (flag_set('E'))
+    Settings::energyTraceEnabled = true;
+  if (flag_set('L'))
+    Settings::energyTraceInterval = atoi(get_arg('L').c_str());
+  if (flag_set('I'))
+    Settings::initMethod = get_arg('I');
+
+  // Read ibed file
+  std::vector<MergedLoop> loops;
+  std::vector<MergedAnchor> anchors;
+
+  // Parse chromosomes from -c flag
+  std::vector<std::string> chrs;
+  std::string chromosomes = "genome";
+  BedRegion region_of_interest;
+
+  if (flag_set('c')) {
+    chromosomes = get_arg('c');
+    if (BedRegion::tryParse(chromosomes)) {
+      region_of_interest.parse(chromosomes);
+      chrs.push_back(region_of_interest.chr);
+    } else {
+      chrs = parseChromosomeDescription(chromosomes);
+    }
+    // Read and filter
+    if (!IbedFileIO::readIbedFiltered(ibed_path, loops, anchors, chrs))
+      error_msg("Failed to read ibed file\n");
+  } else {
+    if (!IbedFileIO::readIbed(ibed_path, loops, anchors))
+      error_msg("Failed to read ibed file\n");
+    chrs = parseChromosomeDescription(chromosomes);
+  }
+
+  printf("[ibed] Loaded %d loops, %d anchors from ibed\n",
+         (int)loops.size(), (int)anchors.size());
+
+  // Create temp directory for extracted files
+  std::string tmpdir = outdir + "ibed_tmp/";
+  portable_mkdir(outdir.c_str());
+  portable_mkdir(tmpdir.c_str());
+
+  // Write temp BED and BEDPE
+  std::string tmp_bed = tmpdir + "anchors.bed";
+  std::string tmp_bedpe = tmpdir + "clusters.bedpe";
+
+  MergedFileIO::writeBed(anchors, tmp_bed);
+  MergedFileIO::writeBedpe(loops, tmp_bedpe);
+
+  // Override Settings data paths
+  Settings::dataDirectory = "";
+  Settings::dataAnchors = tmp_bed;
+  Settings::dataPetClusters = tmp_bedpe;
+  Settings::dataSingletons = "";
+  Settings::dataSingletonsInter = "";
+  Settings::dataFactors = "ibed";
+
+  std::string name = flag_set('n') ? get_arg('n') : "ibed";
+  bool use_new_file_format = flag_set('z');
+  int length_limit = flag_set('l') ? atoi(get_arg('l').c_str()) : -1;
+  int chr_number_limit = flag_set('u') ? atoi(get_arg('u').c_str()) : -1;
+  int max_level = flag_set('v') ? atoi(get_arg('v').c_str()) : 5;
+  int ensemble_size = flag_set('m') ? atoi(get_arg('m').c_str()) : 1;
+
+  g_output_format = flag_set('F') ? get_arg('F') : "";
+
+  // Create simulation logger
+  portable_mkdir(outdir.c_str());
+  unsigned int seed = 0;
+  if (flag_set('j'))
+    seed = (unsigned int)atoi(get_arg('j').c_str());
+  Settings::gpuSeed = seed;
+
+  SimulationLogger logger(outdir, name, seed);
+  logger.logParameter("ibed_input", ibed_path);
+  logger.logParameter("chromosomes", chromosomes);
+  logger.logMilestone("Starting ibed reconstruction");
+
+  args.clear();
+
+  runLooper(chrs, region_of_interest, name, outdir, use_new_file_format,
+            max_level, chr_number_limit, length_limit, ensemble_size,
+            std::vector<std::string>(), &logger);
+
+  // Run territory analysis
+  {
+    std::string hcm_path = ftext("%sloops_%s.hcm", outdir.c_str(), name.c_str());
+    if (file_exists(hcm_path)) {
+      HierarchicalChromosome hc;
+      hc.fromFile(hcm_path);
+      GenomeReconstructor gr;
+      gr.analyze(hc, 1);
+      gr.writeReport(outdir, name);
+    }
+  }
+
+  // Final output validation (also called inside runLooper, but re-check after
+  // territory analysis in case post-processing introduced issues)
+  validateOutputsAndWriteErrorWarning(outdir, name, use_new_file_format,
+                                      ensemble_size);
+
+  logger.logMilestone("ibed reconstruction complete");
+  logger.writeSummary();
+}
+
 int main(int argc, char **argv) {
   setbuf(stdout, NULL);
 
@@ -961,7 +1484,7 @@ int main(int argc, char **argv) {
   int opt = 0;
 
   while ((opt = getopt(argc, argv,
-                       "s:a:o:c:n:l:u:t:d:p:b:e:m:i:v:zf:hr:g:x:j:M:F:EL:I:")) !=
+                       "s:a:o:c:n:l:u:t:d:p:b:e:m:i:v:zf:hr:g:x:j:M:F:EL:I:B:P:")) !=
          EOF) {
     if (optarg == NULL)
       optarg = (char *)"";
@@ -1018,7 +1541,23 @@ int main(int argc, char **argv) {
     logger.logParameter("chromosomes", flag_set('c') ? get_arg('c') : "genome");
     logger.logMilestone("Starting reconstruction");
 
+    // Capture label/outdir before prepareLooper clears args
+    string ter_label = label;
+    string ter_outdir = outdir;
+
     prepareLooper(&logger);
+
+    // Run territory analysis on the reconstructed model
+    {
+      string hcm_path = ftext("%sloops_%s.hcm", ter_outdir.c_str(), ter_label.c_str());
+      if (file_exists(hcm_path)) {
+        HierarchicalChromosome hc_ter;
+        hc_ter.fromFile(hcm_path);
+        GenomeReconstructor gr;
+        gr.analyze(hc_ter, 1);
+        gr.writeReport(ter_outdir, ter_label);
+      }
+    }
 
     logMemoryUsage("after reconstruction");
     logger.logMilestone("Reconstruction complete");
@@ -1047,6 +1586,12 @@ int main(int argc, char **argv) {
     prepareDistMap();
   else if (args['a'] == "metrics")
     prepareMetrics();
+  else if (args['a'] == "M" || args['a'] == "merge")
+    prepareMerge();
+  else if (args['a'] == "S" || args['a'] == "simulate")
+    prepareSimulate();
+  else if (args['a'] == "I" || args['a'] == "ibed")
+    prepareIbed();
   else {
     printf("No matching action specified [%s]!\n", args['a'].c_str());
     usage();

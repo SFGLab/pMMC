@@ -53,7 +53,7 @@ static std::string chrToChainId(const std::string &chr, int chrIndex) {
 }
 
 bool CifWriter::write(HierarchicalChromosome &hc, const std::string &filename,
-                      const std::string &dataName) {
+                      const std::string &dataName, bool useCurrentLevel) {
   FILE *f = fopen(filename.c_str(), "w");
   if (!f) {
     printf("[CIF] Failed to open %s for writing\n", filename.c_str());
@@ -66,8 +66,9 @@ bool CifWriter::write(HierarchicalChromosome &hc, const std::string &filename,
   int atomId = 1;
   int entityId = 1;
 
-  // Use lowest level for maximum detail
-  hc.useLowestLevel();
+  // Use lowest level for maximum detail, unless caller wants current level
+  if (!useCurrentLevel)
+    hc.useLowestLevel();
 
   for (size_t ci = 0; ci < hc.chrs.size(); ++ci) {
     std::string chr = hc.chrs[ci];

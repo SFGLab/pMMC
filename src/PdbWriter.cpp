@@ -38,7 +38,8 @@ static char chrToChainChar(int chrIndex) {
   return 'Z'; // fallback
 }
 
-bool PdbWriter::write(HierarchicalChromosome &hc, const std::string &filename) {
+bool PdbWriter::write(HierarchicalChromosome &hc, const std::string &filename,
+                      bool useCurrentLevel) {
   FILE *f = fopen(filename.c_str(), "w");
   if (!f) {
     printf("[PDB] Failed to open %s for writing\n", filename.c_str());
@@ -50,7 +51,8 @@ bool PdbWriter::write(HierarchicalChromosome &hc, const std::string &filename) {
   fprintf(f, "TITLE     3D GENOME STRUCTURE FROM CUDA-MMC\n");
 
   // Count total atoms first
-  hc.useLowestLevel();
+  if (!useCurrentLevel)
+    hc.useLowestLevel();
   int totalAtoms = 0;
   for (const auto &chr : hc.chrs) {
     if (hc.current_level.find(chr) != hc.current_level.end())

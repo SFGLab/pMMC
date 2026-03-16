@@ -34,11 +34,66 @@
 #include <HierarchicalChromosome.h>
 #include <InteractionArc.h>
 #include <InteractionArcs.h>
+#include <MultiscaleEnergy.h>
 #include <SimulationLogger.h>
 #include <platform.h>
 
 // Forward declaration
 class SimulationLogger;
+
+/**
+ * @brief Persistent GPU resource cache to avoid per-block alloc/free overhead.
+ *
+ * All CUDA types stored as void* to avoid including cuda_runtime.h in the
+ * header (which would conflict with HierarchicalChromosome.h's float3 stub).
+ */
+struct GpuResourceCache {
+  bool initialized = false;
+
+  // Device properties (queried once)
+  int sm_count = 0;
+  int dev_id = 0;
+  // cudaDeviceProp stored opaquely — accessed only from .cu files
+  char dev_prop_storage[4096] = {};  // sizeof(cudaDeviceProp) varies by CUDA version
+
+  // Persistent curandState for arcs kernel (void* to avoid CUDA header dep)
+  void *d_arcs_states = nullptr;
+  int arcs_states_count = 0;
+  bool arcs_states_seeded = false;
+
+  // Persistent curandState for smooth kernel
+  void *d_smooth_states = nullptr;
+  int smooth_states_count = 0;
+  bool smooth_states_seeded = false;
+
+  // Persistent isDone flags (device booleans)
+  void *d_arcs_isDone = nullptr;
+  void *d_smooth_isDone = nullptr;
+
+  // Persistent device buffers for arcs kernel (avoid per-call thrust alloc)
+  void *d_arcs_positions = nullptr;   // float3[max_n]
+  void *d_arcs_is_fixed = nullptr;    // int[max_n]
+  void *d_arcs_exp_dist = nullptr;    // float[max_n * max_n]
+  void *d_arcs_loop_pairs = nullptr;  // int2[max_loops]
+  void *d_arcs_loop_params = nullptr; // float2[max_loops]
+  void *d_arcs_best_score = nullptr;  // float[max_warps]
+  void *d_arcs_best_pos = nullptr;    // float3[max_warps * max_n]
+  int arcs_max_n = 0;
+  int arcs_max_warps = 0;
+  int arcs_max_loops = 0;
+
+  // Persistent device buffers for smooth kernel
+  void *d_smooth_positions = nullptr; // float3[max_n]
+  void *d_smooth_fixed = nullptr;     // bool[max_n] (stored as char)
+  void *d_smooth_dist = nullptr;      // float[max_n]
+  int smooth_max_n = 0;
+
+  void init();
+  void initArcsBuffers(int max_n, int max_warps, int max_loops);
+  void initSmoothBuffers(int max_n);
+  void cleanup();
+  ~GpuResourceCache() { cleanup(); }
+};
 
 /**
  * @class LooperSolver
@@ -419,6 +474,9 @@ public:
   void setLogger(SimulationLogger *log) { sim_logger = log; }
 
   int total_mc_steps;                /**< Accumulated MC step count across all phases. */
+  GpuResourceCache gpu_cache;        /**< Persistent GPU resources for arcs+smooth kernels. */
+
+  MultiscaleEnergy energy;           /**< Two-scale energy decomposition tracker. */
 
   InteractionArcs arcs;              /**< All loaded interaction arcs data. */
   std::vector<Cluster> clusters;     /**< Global cluster array (all levels, all chromosomes). */

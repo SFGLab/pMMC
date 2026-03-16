@@ -428,6 +428,14 @@ float LooperSolver::ParallelMonteCarloHeatmap(float step_size) {
   score_density = calcScoreDensity();
   output(2, "initial score: %lf (density=%lf)\n", score_curr, score_density);
 
+  // Guard: skip MC if heatmap score is NaN (empty heatmap at this level)
+  if (score_curr != score_curr || score_curr < 1e-6) {
+    printf("WARNING: heatmap score is NaN or trivial (%.6f), skipping MC at this level\n", score_curr);
+    cudaFree(d_isDone);
+    cudaFree(devStates);
+    return 0.0f;
+  }
+
   MonteCarloHeatmapKernel<<<blocks, threads,
                             active_region.size() * sizeof(float)>>>(
       devStates, thrust::raw_pointer_cast(d_clusters_fixed.data()),

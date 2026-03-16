@@ -29,6 +29,10 @@ set(SOURCES
   src/CifWriter.cpp
   src/PdbWriter.cpp
   src/MdsInitializer.cpp
+  src/GenomeReconstructor.cpp
+  src/MergedFileIO.cpp
+  src/IbedFileIO.cpp
+  src/HeatmapImageWriter.cpp
   thirdparty/common.cpp
   thirdparty/ini.c
   thirdparty/INIReader.cpp
@@ -65,6 +69,10 @@ set(HEADERS
   include/CifWriter.h
   include/PdbWriter.h
   include/MdsInitializer.h
+  include/GenomeReconstructor.h
+  include/MergedFileIO.h
+  include/IbedFileIO.h
+  include/HeatmapImageWriter.h
   thirdparty/common.h
   thirdparty/ini.h
   thirdparty/INIReader.h

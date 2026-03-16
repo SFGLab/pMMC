@@ -29,7 +29,8 @@ public:
    * @return True on success.
    */
   static bool write(HierarchicalChromosome &hc, const std::string &filename,
-                    const std::string &dataName = "cudaMMC");
+                    const std::string &dataName = "cudaMMC",
+                    bool useCurrentLevel = false);
 
   /**
    * @brief Write a flat list of positions to mmCIF.

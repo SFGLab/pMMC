@@ -101,6 +101,7 @@ float Settings::springConstantSqueezeArcs;
 float Settings::loopStiffness;
 float Settings::loopEquilibriumDistance;
 std::string Settings::loopConstraintsFile;
+std::string Settings::mergedInputFile;
 
 float Settings::maxTemp;
 float Settings::dtTemp;
@@ -273,6 +274,7 @@ void Settings::init() {
   loopStiffness = 1.0f;
   loopEquilibriumDistance = 1.5f;
   loopConstraintsFile = "";
+  mergedInputFile = "";
 }
 
 void Settings::print(int level) {
@@ -465,6 +467,7 @@ bool Settings::loadFromINI(std::string ini_path) {
 
   dataCentromeres = reader.Get("data", "centromeres", dataCentromeres);
   dataSegmentsSplit = reader.Get("data", "segment_split", dataSegmentsSplit);
+  mergedInputFile = reader.Get("data", "merged_input", mergedInputFile);
 
   dataSegmentHeatmap =
       reader.Get("template", "segment_heatmap", dataSegmentHeatmap);

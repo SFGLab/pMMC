@@ -216,6 +216,11 @@ public:
   static std::string loopConstraintsFile; /**< Path to external loop constraints file. */
   ///@}
 
+  /** @name Merged Input */
+  ///@{
+  static std::string mergedInputFile;    /**< Path to .merged file (merged BED+BEDPE). */
+  ///@}
+
   /** @name MC Simulated Annealing: Heatmap Level (Segment/Chromosome) */
   ///@{
   static float maxTempHeatmap;                       /**< Starting temperature. */
