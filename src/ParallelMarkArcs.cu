@@ -96,6 +96,7 @@ void InteractionArcs::parallelMarkArcs(bool ignore_missing) {
     std::sort(raw_arcs[chr].begin(), raw_arcs[chr].end());
 
     cnt = static_cast<int>(raw_arcs[chr].size());
+    int non_matching_count = 0;
 
     std::vector<Anchor> current_anchors = anchors[chr];
     std::vector<InteractionArc> current_raw_arcs = raw_arcs[chr];
@@ -156,8 +157,7 @@ void InteractionArcs::parallelMarkArcs(bool ignore_missing) {
         end = h_outputs_end[i];
 
         if ((st == -1 || end == -1)) {
-          printf("! error: non-matching arc\n");
-          raw_arcs[chr][i].print();
+          ++non_matching_count;
           continue;
         }
 
@@ -234,6 +234,9 @@ void InteractionArcs::parallelMarkArcs(bool ignore_missing) {
         tmp_arcs[end].push_back(arc);
       }
     }
+
+    if (non_matching_count > 0)
+      printf("  %d non-matching arcs skipped\n", non_matching_count);
 
     arcs_cnt[chr] = static_cast<int>(arcs[chr].size()); // update count
     tmp_arcs.clear();

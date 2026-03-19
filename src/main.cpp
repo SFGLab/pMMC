@@ -56,6 +56,7 @@ void usage(const char *act = "", bool quit = true) {
   printf("  merge (M)      Merge BED + BEDPE into a single merged file\n");
   printf("  simulate (S)   Reconstruct from merged file\n");
   printf("  ibed (I)       Reconstruct from .ibed file\n");
+  printf("  convert (X)    Convert HCM file to PDB/CIF format\n");
   printf("\nCommon options:\n");
   printf("  -a  action to perform\n");
   printf("  -s  path to settings file\n");
@@ -1477,6 +1478,46 @@ void prepareIbed() {
   logger.writeSummary();
 }
 
+// Convert HCM file to PDB and/or CIF format.
+// Usage: pMMC -a convert -i <input.hcm> -o <output_dir/> [-F cif|pdb|both]
+void prepareConvert() {
+  if (!flag_set('i'))
+    error_msg("No input HCM file specified [-i]\n");
+
+  string input = get_arg('i');
+  string outdir = flag_set('o') ? get_arg('o') : "./";
+  string format = flag_set('F') ? get_arg('F') : "both";
+
+  printf("[convert] Reading HCM: %s\n", input.c_str());
+  HierarchicalChromosome hc;
+  hc.fromFile(input);
+
+  // Ensure current_level is populated (fromFilePreviousFormat may not call useTopLevel)
+  hc.useTopLevel();
+  hc.useLowestLevel();
+
+  // Derive base name from input filename (strip path and .hcm extension)
+  string base = input;
+  size_t slash = base.find_last_of("/\\");
+  if (slash != string::npos)
+    base = base.substr(slash + 1);
+  if (base.size() > 4 && base.substr(base.size() - 4) == ".hcm")
+    base = base.substr(0, base.size() - 4);
+
+  string outbase = outdir + base;
+
+  if (format == "cif" || format == "both") {
+    string cif_path = outbase + ".cif";
+    CifWriter::write(hc, cif_path, "cudaMMC", false);
+    printf("[convert] Wrote CIF: %s\n", cif_path.c_str());
+  }
+  if (format == "pdb" || format == "both") {
+    string pdb_path = outbase + ".pdb";
+    PdbWriter::write(hc, pdb_path, false);
+    printf("[convert] Wrote PDB: %s\n", pdb_path.c_str());
+  }
+}
+
 int main(int argc, char **argv) {
   setbuf(stdout, NULL);
 
@@ -1592,6 +1633,8 @@ int main(int argc, char **argv) {
     prepareSimulate();
   else if (args['a'] == "I" || args['a'] == "ibed")
     prepareIbed();
+  else if (args['a'] == "X" || args['a'] == "convert")
+    prepareConvert();
   else {
     printf("No matching action specified [%s]!\n", args['a'].c_str());
     usage();

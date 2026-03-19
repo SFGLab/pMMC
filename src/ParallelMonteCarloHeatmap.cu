@@ -142,7 +142,7 @@ __device__ float calcScoreHeatmapSingleActiveRegion(
     const int &heatmapDiagonalSize, const int &activeRegionSize,
     const int &chromosomeBoundariesSize, const half3 &curr_vector,
     int &warpIdx) {
-  double err = 0.0;
+  float err = 0.0f;
   float helper;
   int st = 0, end = activeRegionSize - 1;
   if (heatmapSize != activeRegionSize) {

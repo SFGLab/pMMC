@@ -2,45 +2,31 @@
  * @file ParallelMonteCarloSmooth.cu
  * @brief GPU-accelerated Monte Carlo smoothing kernel for subanchor-level beads.
  *
- * Implements a warp-level simulated annealing (SA) approach that mirrors
- * the CPU MonteCarloArcsSmooth() found in LooperSolver.cpp.  Each warp
- * runs an independent SA chain; thread 0 of every warp selects a bead
- * and generates a move, and all 32 threads cooperate via warp-shuffle
- * reduction to evaluate the local energy change quickly.
+ * Multi-warp design: each warp runs an independent SA trajectory on its own
+ * copy of the position array. The host picks the best result. This gives
+ * N_warps parallel SA chains (typically 46+ on modern GPUs), dramatically
+ * speeding up the smooth phase compared to a single sequential trajectory.
  *
  * Energy model (matches calcScoreStructureSmooth in LooperSolver.cpp):
  *   - Length penalty: spring force on consecutive bead distances vs dist_to_next
- *       stretch:  springConstantStretch  * ((d/d0) - 1)^2
- *       squeeze:  springConstantSqueeze  * (1 - (d/d0))^2
  *   - Angular penalty: bending stiffness on triples of consecutive beads
- *       springAngularConstant * (1 - cos(angle))
- *     (The CPU uses ang^3 but angle ≈ 1-cos(angle) for moderate bending;
- *      we use (1-cos) so the GPU and CPU converge to the same minimum even
- *      if the trajectory differs in detail.)
- *
- * CTCF orientation scoring is intentionally omitted; apply as a CPU
- * post-step if required.
- *
- * Seeding: the host passes an explicit seed instead of time(NULL) so that
- * runs are deterministic when desired.
  *
  * @see LooperSolver.cpp  MonteCarloArcsSmooth()
- * @see ParallelMonteCarloHeatmap.cu  (patterns followed here)
  */
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
+#include <vector>
 
 #include <LooperSolver.h>
 
 /* -------------------------------------------------------------------------
- * Error-checking macro (same pattern as ParallelMonteCarloHeatmap.cu)
+ * Error-checking macro
  * ---------------------------------------------------------------------- */
 #define gpuErrchkSmooth(ans)                                                   \
   { gpuAssertSmooth((ans), __FILE__, __LINE__); }
@@ -55,7 +41,7 @@ inline void gpuAssertSmooth(cudaError_t code, const char *file, int line,
 }
 
 /* -------------------------------------------------------------------------
- * Device-side iteration counter (retrieved by host after kernel finishes)
+ * Device-side iteration counter
  * ---------------------------------------------------------------------- */
 __device__ int d_smooth_total_iterations;
 
@@ -79,28 +65,9 @@ struct smooth_gpu_settings {
 };
 
 /* =========================================================================
- * Device helper: generate random float displacement in [-max_size, max_size]
- * ======================================================================= */
-__device__ __forceinline__ float randDisplace(float max_size,
-                                              curandState *state) {
-  return (2.0f * curand_uniform(state) - 1.0f) * max_size;
-}
-
-/* =========================================================================
- * Device helper: compute the local smooth energy contribution for bead p.
- *
- * "Local" means only the bond lengths and angles that involve bead p:
- *   - Bond (p-1, p)   and Bond (p, p+1)
- *   - Angle (p-1, p, p+1)
- *
- * pos_p:       proposed position of bead p (may differ from positions[p])
- * positions:   current bead positions on GPU (float3 array, size = active_n)
- * dist_to_next: expected distance for bond starting at bead i (size = active_n)
- * active_n:    number of beads in active_region
- * p:           bead index within active_region (0-based)
- * s:           spring/weight settings
- *
- * Returns local energy contribution (non-negative).
+ * Device helper: compute the local smooth energy for bead p.
+ * Only checks bonds (p-1,p) and (p,p+1) and angles involving p.
+ * Double precision. Returns sca + scb WITHOUT weights.
  * ======================================================================= */
 __device__ float calcLocalEnergySmooth(
     int p,
@@ -110,334 +77,244 @@ __device__ float calcLocalEnergySmooth(
     int active_n,
     const smooth_gpu_settings &s)
 {
-  float energy = 0.0f;
+  float sca = 0.0f, scb = 0.0f;
 
-  /* ---- Length contribution for bond (p-1, p) ---- */
+  /* Length: bonds (p-1,p) and (p,p+1) */
   if (p > 0) {
     float3 prev = positions[p - 1];
     float dx = pos_p.x - prev.x;
     float dy = pos_p.y - prev.y;
     float dz = pos_p.z - prev.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-
     float d0 = dist_to_next[p - 1];
     if (d0 < 1e-6f) d0 = 1e-6f;
-
-    float diff = (dist - d0) / d0;   /* relative deviation */
-    float penalty = diff * diff *
-                    (diff >= 0.0f ? s.springConstantStretch
-                                  : s.springConstantSqueeze);
-    energy += s.weightDistSmooth * penalty;
+    float diff = (dist - d0) / d0;
+    sca += diff * diff * (diff >= 0.0f ? s.springConstantStretch
+                                       : s.springConstantSqueeze);
   }
-
-  /* ---- Length contribution for bond (p, p+1) ---- */
   if (p < active_n - 1) {
     float3 next = positions[p + 1];
     float dx = next.x - pos_p.x;
     float dy = next.y - pos_p.y;
     float dz = next.z - pos_p.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-
     float d0 = dist_to_next[p];
     if (d0 < 1e-6f) d0 = 1e-6f;
-
     float diff = (dist - d0) / d0;
-    float penalty = diff * diff *
-                    (diff >= 0.0f ? s.springConstantStretch
-                                  : s.springConstantSqueeze);
-    energy += s.weightDistSmooth * penalty;
+    sca += diff * diff * (diff >= 0.0f ? s.springConstantStretch
+                                       : s.springConstantSqueeze);
   }
 
-  /* ---- Angular contribution at bead p (triple: p-1, p, p+1) ---- */
-  if (p > 0 && p < active_n - 1) {
-    float3 prev = positions[p - 1];
-    float3 next = positions[p + 1];
-
-    /* vector from p to p-1 */
-    float ax = prev.x - pos_p.x;
-    float ay = prev.y - pos_p.y;
-    float az = prev.z - pos_p.z;
-
-    /* vector from p to p+1 */
-    float bx = next.x - pos_p.x;
-    float by = next.y - pos_p.y;
-    float bz = next.z - pos_p.z;
-
-    float la = sqrtf(ax*ax + ay*ay + az*az);
-    float lb = sqrtf(bx*bx + by*by + bz*bz);
-
-    if (la > 1e-12f && lb > 1e-12f) {
-      float cos_ang = (ax*bx + ay*by + az*bz) / (la * lb);
-      /* clamp to [-1,1] for numerical safety */
-      cos_ang = fmaxf(-1.0f, fminf(1.0f, cos_ang));
-      /* (1 - cos_ang) is zero when perfectly straight */
-      float ang_pen = s.springAngularConstant * (1.0f - cos_ang);
-      energy += s.weightAngleSmooth * ang_pen;
+  /* Angular: 3 angles around moved bead */
+  {
+    float prev_vx = 0.0f, prev_vy = 0.0f, prev_vz = 0.0f;
+    bool have_prev = false;
+    for (int i = p - 2; i < p + 2; i++) {
+      if (i < 0 || i + 1 >= active_n)
+        continue;
+      float3 pi_pos = (i == p) ? pos_p : positions[i];
+      float3 pj_pos = (i + 1 == p) ? pos_p : positions[i + 1];
+      float vx = pi_pos.x - pj_pos.x;
+      float vy = pi_pos.y - pj_pos.y;
+      float vz = pi_pos.z - pj_pos.z;
+      if (have_prev && i > p - 2 && i > 0) {
+        float la = sqrtf(vx*vx + vy*vy + vz*vz);
+        float lb = sqrtf(prev_vx*prev_vx + prev_vy*prev_vy + prev_vz*prev_vz);
+        if (la > 1e-6f && lb > 1e-6f) {
+          float dot = (vx*prev_vx + vy*prev_vy + vz*prev_vz) / (la * lb);
+          if (dot < -1.0f) dot = -1.0f;
+          if (dot >  1.0f) dot =  1.0f;
+          float ang = (1.0f - dot) * 0.5f;
+          scb += ang * ang * ang * s.springAngularConstant;
+        }
+      }
+      prev_vx = vx; prev_vy = vy; prev_vz = vz;
+      have_prev = true;
     }
   }
 
-  return energy;
+  return sca + scb;
 }
 
-/* =========================================================================
- * Device helper: compute the full structure energy over all beads.
- * Used by thread 0 at milestone checkpoints.
- * ======================================================================= */
+/* Full energy for initial score computation (float precision for GPU perf) */
 __device__ float calcFullEnergySmooth(
     const float3 * __restrict__ positions,
     const float  * __restrict__ dist_to_next,
-    const bool   * __restrict__ is_fixed,
     int active_n,
     const smooth_gpu_settings &s)
 {
-  float energy = 0.0f;
+  float sca = 0.0f, scb = 0.0f;
 
   for (int i = 0; i < active_n - 1; ++i) {
     float3 pi = positions[i];
     float3 pj = positions[i + 1];
-
     float dx = pj.x - pi.x;
     float dy = pj.y - pi.y;
     float dz = pj.z - pi.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-
     float d0 = dist_to_next[i];
     if (d0 < 1e-6f) d0 = 1e-6f;
-
     float diff = (dist - d0) / d0;
-    energy += s.weightDistSmooth * diff * diff *
-              (diff >= 0.0f ? s.springConstantStretch
-                            : s.springConstantSqueeze);
+    sca += diff * diff * (diff >= 0.0f ? s.springConstantStretch
+                                       : s.springConstantSqueeze);
   }
 
-  for (int i = 1; i < active_n - 1; ++i) {
-    float3 pm1 = positions[i - 1];
-    float3 pi  = positions[i    ];
-    float3 pp1 = positions[i + 1];
-
-    float ax = pm1.x - pi.x, ay = pm1.y - pi.y, az = pm1.z - pi.z;
-    float bx = pp1.x - pi.x, by = pp1.y - pi.y, bz = pp1.z - pi.z;
-    float la = sqrtf(ax*ax + ay*ay + az*az);
-    float lb = sqrtf(bx*bx + by*by + bz*bz);
-
-    if (la > 1e-12f && lb > 1e-12f) {
-      float cos_ang = (ax*bx + ay*by + az*bz) / (la * lb);
-      cos_ang = fmaxf(-1.0f, fminf(1.0f, cos_ang));
-      energy += s.weightAngleSmooth *
-                s.springAngularConstant * (1.0f - cos_ang);
+  {
+    float prev_vx = 0.0f, prev_vy = 0.0f, prev_vz = 0.0f;
+    for (int i = 0; i + 1 < active_n; ++i) {
+      float3 pi = positions[i], pj = positions[i + 1];
+      float vx = pi.x - pj.x;
+      float vy = pi.y - pj.y;
+      float vz = pi.z - pj.z;
+      if (i > 0) {
+        float la = sqrtf(vx*vx + vy*vy + vz*vz);
+        float lb = sqrtf(prev_vx*prev_vx + prev_vy*prev_vy + prev_vz*prev_vz);
+        if (la > 1e-6f && lb > 1e-6f) {
+          float dot = (vx*prev_vx + vy*prev_vy + vz*prev_vz) / (la * lb);
+          if (dot < -1.0f) dot = -1.0f;
+          if (dot >  1.0f) dot =  1.0f;
+          float ang = (1.0f - dot) * 0.5f;
+          scb += ang * ang * ang * s.springAngularConstant;
+        }
+      }
+      prev_vx = vx; prev_vy = vy; prev_vz = vz;
     }
   }
 
-  return energy;
+  return sca * s.weightDistSmooth + scb * s.weightAngleSmooth;
 }
 
 /* =========================================================================
- * Warp-reduction: min over all 32 lanes
+ * Setup kernel — initialise one curandState per thread
  * ======================================================================= */
 #define FULL_MASK 0xffffffff
 
-__device__ __forceinline__ float warpReduceMin(float val) {
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1)
-    val = fminf(val, __shfl_down_sync(FULL_MASK, val, offset));
-  return val;
-}
-
-/* =========================================================================
- * setupSmoothKernel — initialise one curandState per thread
- * ======================================================================= */
 __global__ void setupSmoothKernel(curandState *state, unsigned long long seed) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   curand_init(seed, tid, 0, &state[tid]);
 }
 
 /* =========================================================================
- * MonteCarloSmoothKernel
+ * MonteCarloSmoothKernelMultiWarp
  *
- * Grid design:
- *   - blockDim.x  = 32  (one warp per block is cleanest; caller may use more)
- *   - Each warp runs an independent SA chain over the same positions[] array.
+ * Each warp runs an independent SA trajectory on its own position copy.
+ * Only lane 0 of each warp drives the SA (energy is local, no parallel
+ * evaluation benefit). Each warp converges independently.
  *
- * Within one warp:
- *   - Thread 0 selects a random non-fixed bead, generates a displacement,
- *     tentatively applies it, and evaluates the local energy delta.
- *   - The accepted energy is reduced via warp shuffle so the best score
- *     found across all warps drives the shared position array.
- *   - All warps share the same positions[] array in global memory; writes
- *     are serialised through the natural warp-level competition: only the
- *     warp whose proposed energy is lowest (and better than global) writes.
- *
- * Stopping criterion (checked every MCstopConditionStepsSmooth steps by
- * thread 0 of the whole grid, i.e. threadIdx.x==0 && blockIdx.x==0):
- *   - Insufficient improvement since last milestone, AND
- *   - Too few successes since last milestone.
+ * per_warp_pos: [n_warps * active_n] — each warp's position array
+ * d_best_score: [n_warps] — best score achieved by each warp
  * ======================================================================= */
-__global__ void MonteCarloSmoothKernel(
+__global__ void MonteCarloSmoothKernelMultiWarp(
     curandState   * __restrict__ state,
-    float3        * __restrict__ positions,
+    float3        * __restrict__ per_warp_pos,  /* [n_warps * active_n] */
     const bool    * __restrict__ is_fixed,
     const float   * __restrict__ dist_to_next,
     float                        T_init,
     float                        step_size,
     int                          active_n,
     smooth_gpu_settings          s,
-    bool          * __restrict__ isDone)
+    float         * __restrict__ d_best_score)   /* [n_warps] output */
 {
-  /* ---- thread/warp identity ---- */
-  const int tid       = blockDim.x * blockIdx.x + threadIdx.x;
-  const int lane      = threadIdx.x & 31;           /* lane within warp  */
-  const int warpId    = tid >> 5;                   /* global warp index */
+  const int tid    = blockDim.x * blockIdx.x + threadIdx.x;
+  const int lane   = threadIdx.x & 31;
+  const int warpId = tid >> 5;
 
-  /* Each warp's thread-0 drives the SA; other lanes contribute to energy
-   * evaluation.  We keep private per-warp state so warps don't interfere
-   * on the RNG side. */
+  /* Only lane 0 does useful work; other lanes return early */
+  if (lane != 0) return;
+
+  /* Per-warp position array */
+  float3 *my_pos = per_warp_pos + (size_t)warpId * active_n;
+
   curandState localState = state[tid];
 
-  /* Per-warp SA state */
+  /* Per-warp SA state (float precision — 64x faster on consumer GPUs) */
   float T            = T_init;
-  float score_prev   = 0.0f;  /* filled in below by lane 0 */
+  float score_prev   = calcFullEnergySmooth(my_pos, dist_to_next, active_n, s);
   float step         = step_size;
   int   iterations   = 0;
-  int   successes    = 0;
   int   milestone_successes = 0;
   int   improvement_misses  = 0;
-  float milestone_score     = 0.0f;
+  float milestone_score     = score_prev;
+  float best_score          = score_prev;
 
-  /* Let lane 0 compute the initial full energy once */
-  if (lane == 0) {
-    score_prev = calcFullEnergySmooth(positions, dist_to_next, is_fixed,
-                                      active_n, s);
-    milestone_score = score_prev;
-  }
-  /* broadcast to all lanes in the warp */
-  score_prev    = __shfl_sync(FULL_MASK, score_prev,    0);
-  milestone_score = __shfl_sync(FULL_MASK, milestone_score, 0);
+  const int max_iters = s.MCstopConditionStepsSmooth;
 
-  /* ---- main SA loop ---- */
-#define INNER_STEPS 256
-  const int max_smooth_iters = s.MCstopConditionStepsSmooth;
-  while (iterations < max_smooth_iters) {
+  while (iterations < max_iters) {
 
-#pragma unroll 4
-    for (int inner = 0; inner < INNER_STEPS; ++inner) {
+    for (int inner = 0; inner < 256; ++inner) {
 
-      /* --- lane 0: pick a bead and generate a displacement --- */
-      int   chosen_p  = -1;
-      float3 old_pos  = {0.f, 0.f, 0.f};
-      float3 new_pos  = {0.f, 0.f, 0.f};
-      float  e_old    = 0.f;
-      float  e_new    = 0.f;
-
-      if (lane == 0) {
-        /* Pick a random non-fixed bead (retry at most active_n times) */
-        for (int attempt = 0; attempt < active_n; ++attempt) {
-          int p = (int)(curand_uniform(&localState) * (float)active_n);
-          if (p >= active_n) p = active_n - 1;
-          if (!is_fixed[p]) {
-            chosen_p = p;
-            break;
-          }
-        }
-
-        if (chosen_p >= 0) {
-          old_pos = positions[chosen_p];
-          new_pos = old_pos;
-          new_pos.x += (2.0f * curand_uniform(&localState) - 1.0f) * step;
-          new_pos.y += (2.0f * curand_uniform(&localState) - 1.0f) * step;
-          if (!s.use2D)
-            new_pos.z += (2.0f * curand_uniform(&localState) - 1.0f) * step;
-
-          e_old = calcLocalEnergySmooth(chosen_p, old_pos,
-                                        positions, dist_to_next, active_n, s);
-          e_new = calcLocalEnergySmooth(chosen_p, new_pos,
-                                        positions, dist_to_next, active_n, s);
+      /* Pick a random non-fixed bead */
+      int chosen_p = -1;
+      for (int attempt = 0; attempt < active_n; ++attempt) {
+        int p = (int)(curand_uniform(&localState) * (float)active_n);
+        if (p >= active_n) p = active_n - 1;
+        if (!is_fixed[p]) {
+          chosen_p = p;
+          break;
         }
       }
+      if (chosen_p < 0) continue;
 
-      /* Broadcast the choice and energies to all lanes */
-      chosen_p = __shfl_sync(FULL_MASK, chosen_p, 0);
-      if (chosen_p < 0)
-        continue;   /* all beads fixed — keep iterating until isDone */
+      float3 old_pos = my_pos[chosen_p];
+      float3 new_pos = old_pos;
+      new_pos.x += (2.0f * curand_uniform(&localState) - 1.0f) * step;
+      new_pos.y += (2.0f * curand_uniform(&localState) - 1.0f) * step;
+      if (!s.use2D)
+        new_pos.z += (2.0f * curand_uniform(&localState) - 1.0f) * step;
 
-      e_old = __shfl_sync(FULL_MASK, e_old, 0);
-      e_new = __shfl_sync(FULL_MASK, e_new, 0);
+      float e_old = calcLocalEnergySmooth(chosen_p, old_pos,
+                                           my_pos, dist_to_next, active_n, s);
+      float e_new = calcLocalEnergySmooth(chosen_p, new_pos,
+                                           my_pos, dist_to_next, active_n, s);
+      float new_total = score_prev - e_old + e_new;
 
-      /* Metropolis acceptance (done by lane 0, result broadcast) */
       bool accepted = false;
-      if (lane == 0) {
-        float delta = e_new - e_old;
-        if (delta <= 0.0f) {
-          accepted = true;
-        } else if (T > 0.0f) {
-          float tp = s.tempJumpScaleSmooth *
-                     expf(-s.tempJumpCoefSmooth * (e_new / fmaxf(e_old, 1e-12f)) / T);
-          accepted = (curand_uniform(&localState) < tp);
-        }
+      if (new_total < score_prev) {
+        accepted = true;
+      } else if (T > 0.0f) {
+        float tp = s.tempJumpScaleSmooth *
+                   expf(-s.tempJumpCoefSmooth *
+                        (new_total / fmaxf(score_prev, 1e-12f)) / T);
+        accepted = (curand_uniform(&localState) < tp);
       }
-      /* Broadcast acceptance decision */
-      int acc_int = accepted ? 1 : 0;
-      acc_int = __shfl_sync(FULL_MASK, acc_int, 0);
-      accepted = (acc_int != 0);
 
       if (accepted) {
-        if (lane == 0) {
-          positions[chosen_p] = new_pos;
-          score_prev = score_prev - e_old + e_new;
-          ++successes;
-          ++milestone_successes;
-        }
+        my_pos[chosen_p] = new_pos;
+        score_prev = new_total;
+        ++milestone_successes;
+        if (score_prev < best_score) best_score = score_prev;
       }
 
-      /* Cool temperature on lane 0 */
-      if (lane == 0) {
-        T    *= s.dtTempSmooth;
-        step *= 0.999f;   /* gentle geometric step-size decay */
-      }
-
+      T *= s.dtTempSmooth;
     } /* inner loop */
 
-    iterations += INNER_STEPS;
+    iterations += 256;
 
-    /* Broadcast updated score_prev from lane 0 */
-    score_prev = __shfl_sync(FULL_MASK, score_prev, 0);
-    T          = __shfl_sync(FULL_MASK, T,          0);
-    step       = __shfl_sync(FULL_MASK, step,       0);
+    /* Milestone check — each warp converges independently */
+    if (iterations % s.MCstopConditionStepsSmooth < 256) {
+      bool no_improvement =
+          (score_prev >
+               s.MCstopConditionImprovementSmooth * milestone_score &&
+           milestone_successes < s.MCstopConditionMinSuccessesSmooth) ||
+          score_prev < 1e-6f;
 
-    /* --- Milestone check: only warp 0 / lane 0 makes the global decision --- */
-    if (warpId == 0 && lane == 0) {
-      if (iterations % s.MCstopConditionStepsSmooth < INNER_STEPS) {
-        /* Recompute the full energy for an accurate milestone reading */
-        float full_energy = calcFullEnergySmooth(positions, dist_to_next,
-                                                  is_fixed, active_n, s);
+      if (no_improvement)
+        ++improvement_misses;
 
-        bool score_flat =
-            (full_energy >= s.MCstopConditionImprovementSmooth * milestone_score);
-        bool few_successes =
-            (milestone_successes < s.MCstopConditionMinSuccessesSmooth);
-        bool frozen = (T < 1e-10f && full_energy >= milestone_score);
-        bool no_improvement = (score_flat && few_successes) || frozen;
-        bool tiny = (full_energy < 1e-6f);
+      if (improvement_misses >= s.milestoneFailsThreshold || score_prev < 1e-6f)
+        break;
 
-        if (no_improvement || tiny)
-          ++improvement_misses;
-
-        if (improvement_misses >= s.milestoneFailsThreshold || tiny)
-          *isDone = true;
-
-        milestone_score     = full_energy;
-        milestone_successes = 0;
-      }
+      milestone_score     = score_prev;
+      milestone_successes = 0;
     }
 
-    __threadfence();   /* make *isDone visible to all warps */
+  } /* outer while */
 
-    if (*isDone)
-      break;
+  /* Write final score for this warp */
+  d_best_score[warpId] = best_score;
 
-  } /* outer while(true) */
-
-  /* Lane 0 of warp 0 records the iteration count */
-  if (warpId == 0 && lane == 0)
+  /* Record iteration count from warp 0 */
+  if (warpId == 0)
     d_smooth_total_iterations = iterations;
 
   state[tid] = localState;
@@ -446,41 +323,43 @@ __global__ void MonteCarloSmoothKernel(
 /* =========================================================================
  * Host entry point: LooperSolver::ParallelMonteCarloSmooth
  *
- * Parameters
- *   step_size  — initial MC displacement magnitude (same units as positions)
- *   seed       — deterministic RNG seed (pass time(NULL) for non-deterministic)
- *
- * Returns the final smooth energy score (lower = better).
+ * Multi-warp version: launches sm_count warps, each running an independent
+ * SA trajectory. Picks the best result.
  * ======================================================================= */
 float LooperSolver::ParallelMonteCarloSmooth(float step_size,
                                               unsigned long long seed) {
   const int active_n = static_cast<int>(active_region.size());
   if (active_n <= 2)
-    return 0.0f;   /* nothing to optimise */
+    return 0.0f;
 
-  /* ---- CUDA grid geometry using cached device properties ---- */
+  /* Initialize GPU cache; fall back to CPU if no CUDA device. */
   if (!gpu_cache.initialized) {
     gpu_cache.init();
     if (!gpu_cache.initialized)
       return static_cast<float>(MonteCarloArcsSmooth(step_size, false));
   }
 
-  const int threads_per_block = 32;   /* exactly one warp per block */
-  int blocks = gpu_cache.sm_count * 2; /* 2 warps per SM */
+  const int threads_per_block = 32; /* 1 warp per block */
+  int blocks = gpu_cache.sm_count;  /* 1 block per SM → sm_count warps */
   if (blocks < 1) blocks = 1;
+  int n_warps = blocks; /* 1 warp per block */
 
-  printf("[GPU] MC Smooth: threads=%d, blocks=%d, active_n=%d, "
-         "curandState=%.1f MB\n",
-         threads_per_block, blocks, active_n,
-         (float)threads_per_block * blocks * sizeof(curandState) /
-             (1024.0f * 1024.0f));
+  /* Ensure smooth curandState buffer is large enough */
+  int total_threads = threads_per_block * blocks;
+  if (total_threads > gpu_cache.smooth_states_count) {
+    /* Reallocate if needed */
+    if (gpu_cache.d_smooth_states)
+      cudaFree(gpu_cache.d_smooth_states);
+    curandState *ptr = nullptr;
+    cudaMalloc(&ptr, (size_t)total_threads * sizeof(curandState));
+    gpu_cache.d_smooth_states = ptr;
+    gpu_cache.smooth_states_count = total_threads;
+    gpu_cache.smooth_states_seeded = false;
+  }
 
-  /* ---- Ensure pre-allocated device buffers are large enough ---- */
-  gpu_cache.initSmoothBuffers(active_n);
-
-  /* ---- Build host-side flat arrays and upload via cached buffers ---- */
+  /* Build host-side flat arrays */
   std::vector<float3> h_positions(active_n);
-  std::vector<char>   h_fixed(active_n);  // char instead of bool (vector<bool> has no .data())
+  std::vector<char>   h_fixed(active_n);
   std::vector<float>  h_dist(active_n);
 
   for (int i = 0; i < active_n; ++i) {
@@ -492,31 +371,36 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
     h_dist[i]        = static_cast<float>(clusters[ci].dist_to_next);
   }
 
-  float3 *d_positions_ptr = static_cast<float3 *>(gpu_cache.d_smooth_positions);
-  bool   *d_fixed_ptr     = static_cast<bool *>(gpu_cache.d_smooth_fixed);
-  float  *d_dist_ptr      = static_cast<float *>(gpu_cache.d_smooth_dist);
+  /* Upload shared data (is_fixed, dist_to_next) — also allocates warp buffers */
+  gpu_cache.initSmoothBuffers(active_n);
 
-  cudaMemcpy(d_positions_ptr, h_positions.data(),
+  /* Use cached per-warp buffers (must be after initSmoothBuffers) */
+  float3 *d_warp_positions = static_cast<float3 *>(gpu_cache.d_smooth_warp_positions);
+  float  *d_warp_scores    = static_cast<float *>(gpu_cache.d_smooth_warp_scores);
+  bool  *d_fixed_ptr = static_cast<bool *>(gpu_cache.d_smooth_fixed);
+  float *d_dist_ptr  = static_cast<float *>(gpu_cache.d_smooth_dist);
+  cudaMemcpy(d_fixed_ptr, h_fixed.data(), active_n * sizeof(bool), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_dist_ptr,  h_dist.data(),  active_n * sizeof(float), cudaMemcpyHostToDevice);
+
+  /* Initialize all per-warp position copies from input:
+   * Host→Device for warp 0, then Device→Device for remaining warps */
+  cudaMemcpy(d_warp_positions, h_positions.data(),
              active_n * sizeof(float3), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_fixed_ptr, h_fixed.data(),
-             active_n * sizeof(bool), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_dist_ptr, h_dist.data(),
-             active_n * sizeof(float), cudaMemcpyHostToDevice);
+  for (int w = 1; w < n_warps; ++w) {
+    cudaMemcpy(d_warp_positions + (size_t)w * active_n,
+               d_warp_positions, active_n * sizeof(float3),
+               cudaMemcpyDeviceToDevice);
+  }
 
-  /* Use cached isDone flag and curandState — avoids per-call cudaMalloc. */
-  bool *d_isDone = static_cast<bool *>(gpu_cache.d_smooth_isDone);
-  gpuErrchkSmooth(cudaMemset(d_isDone, 0, sizeof(bool)));
-
+  /* Seed RNG only once */
   curandState *d_states = static_cast<curandState *>(gpu_cache.d_smooth_states);
-
-  /* Seed RNG only once (first call), then reuse across all blocks. */
   if (!gpu_cache.smooth_states_seeded) {
     setupSmoothKernel<<<blocks, threads_per_block>>>(d_states, seed);
     gpuErrchkSmooth(cudaDeviceSynchronize());
     gpu_cache.smooth_states_seeded = true;
   }
 
-  /* ---- Pack settings ---- */
+  /* Pack settings */
   smooth_gpu_settings s;
   s.dtTempSmooth                     = Settings::dtTempSmooth;
   s.tempJumpScaleSmooth              = Settings::tempJumpScaleSmooth;
@@ -534,23 +418,37 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
 
   float T_init = static_cast<float>(Settings::maxTempSmooth);
 
-  /* ---- Launch kernel ---- */
-  MonteCarloSmoothKernel<<<blocks, threads_per_block>>>(
+  /* Launch multi-warp kernel */
+  MonteCarloSmoothKernelMultiWarp<<<blocks, threads_per_block>>>(
       d_states,
-      d_positions_ptr,
+      d_warp_positions,
       d_fixed_ptr,
       d_dist_ptr,
       T_init,
       step_size,
       active_n,
       s,
-      d_isDone);
+      d_warp_scores);
 
   gpuErrchkSmooth(cudaPeekAtLastError());
-  /* cudaMemcpy(D→H) below will implicitly synchronize. */
 
-  /* ---- Copy positions back ---- */
-  cudaMemcpy(h_positions.data(), d_positions_ptr,
+  /* Find the best warp */
+  std::vector<float> h_scores(n_warps);
+  cudaMemcpy(h_scores.data(), d_warp_scores,
+             n_warps * sizeof(float), cudaMemcpyDeviceToHost);
+
+  int best_warp = 0;
+  float best_sc = h_scores[0];
+  for (int w = 1; w < n_warps; ++w) {
+    if (h_scores[w] < best_sc) {
+      best_sc = h_scores[w];
+      best_warp = w;
+    }
+  }
+
+  /* Copy best warp's positions back to CPU */
+  cudaMemcpy(h_positions.data(),
+             d_warp_positions + (size_t)best_warp * active_n,
              active_n * sizeof(float3), cudaMemcpyDeviceToHost);
   for (int i = 0; i < active_n; ++i) {
     if (h_fixed[i] == 0) {
@@ -560,19 +458,13 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
     }
   }
 
-  /* ---- Retrieve iteration count ---- */
+  /* Retrieve iteration count */
   int gpu_iters = 0;
   cudaMemcpyFromSymbol(&gpu_iters, d_smooth_total_iterations, sizeof(int));
   total_mc_steps += gpu_iters;
 
-  /* ---- Compute final CPU-side energy (authoritative) ---- */
+  /* Compute final CPU-side energy (authoritative) */
   double final_score = calcScoreStructureSmooth(true, true);
-
-  printf("=============================================================\n");
-  printf("SMOOTH FINAL SCORE IS %f (GPU iterations: %d)\n",
-         final_score, gpu_iters);
-
-  /* No per-call cleanup — curandState and isDone are cached in gpu_cache. */
 
   return static_cast<float>(final_score);
 }

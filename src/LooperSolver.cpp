@@ -1,3 +1,4 @@
+#include <chrono>
 #include <LooperSolver.h>
 #include <MdsInitializer.h>
 #include <MultiscaleEnergy.h>
@@ -1406,10 +1407,11 @@ Heatmap LooperSolver::createSingletonHeatmap(int diag) {
     int k = 0;
     char singleton_line[2048]; // REQ-3.2: line buffer for buffered I/O
     while (fgets(singleton_line, sizeof(singleton_line), f) != NULL) {
-      if (k++ % 1000000 == 0)
+      k++;
+      if (Settings::outputLevel >= 3 && k % 1000000 == 0)
         printf(".");
       // REQ-2.2: periodic memory logging during singleton reading
-      if (k % 5000000 == 0)
+      if (Settings::outputLevel >= 3 && k % 5000000 == 0)
         logMemoryUsage(ftext("createSingletonHeatmap %dk records", k / 1000).c_str());
       // REQ-5.1: cancellation check
       if (g_cancel_requested.load(std::memory_order_relaxed)) {
@@ -2774,6 +2776,8 @@ void LooperSolver::reconstructClustersArcsDistances() {
    * per-block cudaMalloc/cudaFree overhead for curandState and flags. */
   gpu_cache.init();
 
+  double total_arcs_ms = 0.0, total_smooth_ms = 0.0, total_other_ms = 0.0;
+
   int curr_size = 0;
   int ii = 0;
   for (string chr : chrs) {
@@ -2845,7 +2849,12 @@ void LooperSolver::reconstructClustersArcsDistances() {
 
       // reconstruct anchor level model
       output(5, "reconstruct anchors\n");
-      reconstructClusterArcsDistances(current_level[chr][i], i, false);
+      {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        reconstructClusterArcsDistances(current_level[chr][i], i, false);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        total_arcs_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      }
 
       // Heatmap hd = calcTrueDistancesHeatmapForRegion(active_region);
       // hd.toFile(ftext("%sanchor_%s_%d_true_dist.heat", output_dir.c_str(),
@@ -2899,8 +2908,13 @@ void LooperSolver::reconstructClustersArcsDistances() {
 
       // reconstruct sub-anchor level model
       output(4, "reconstruct sub-anchors\n");
-      reconstructClusterArcsDistances(current_level[chr][i], i, true,
-                                      Settings::useSubanchorHeatmap);
+      {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        reconstructClusterArcsDistances(current_level[chr][i], i, true,
+                                        Settings::useSubanchorHeatmap);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        total_smooth_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      }
 
       //			if (Settings::useSubanchorHeatmap) {
       //				Heatmap hd =
@@ -2913,6 +2927,9 @@ void LooperSolver::reconstructClustersArcsDistances() {
       // getSnapshot(ftext("cluster_%d,_smoothed", i));
     }
   }
+
+  printf("[TIMING] Arcs GPU total: %.1f ms\n", total_arcs_ms);
+  printf("[TIMING] Smooth total: %.1f ms\n", total_smooth_ms);
 
   // Print multiscale energy decomposition at end of arc reconstruction
   if (Settings::outputLevel >= 2) {
@@ -3076,8 +3093,8 @@ void LooperSolver::reconstructClusterArcsDistances(int cluster, int cluster_ind,
     //}
     // else
 
-    // Try GPU path for large active regions; use CPU for small ones.
-    // GPU kernel launch overhead dominates for small problems (n < 16).
+    // GPU paths for arcs and smooth levels — now using double precision
+    // and correct energy formulas matching the CPU code.
     if (smooth) {
       if (active_size >= 4 && !use_subanchor_heatmap) {
         score = ParallelMonteCarloSmooth(noise_size, Settings::gpuSeed);

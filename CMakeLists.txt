@@ -84,7 +84,7 @@ add_executable(pMMC)
 
 # Platform-specific compiler options
 if(MSVC)
-  target_compile_options(pMMC PUBLIC /W3)
+  target_compile_options(pMMC PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:C>:/W3>)
   target_compile_definitions(pMMC PUBLIC _CRT_SECURE_NO_WARNINGS)
 else()
   target_compile_options(pMMC PUBLIC -Wall)

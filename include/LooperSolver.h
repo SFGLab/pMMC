@@ -88,6 +88,12 @@ struct GpuResourceCache {
   void *d_smooth_dist = nullptr;      // float[max_n]
   int smooth_max_n = 0;
 
+  // Persistent per-warp buffers for multi-warp smooth kernel
+  void *d_smooth_warp_positions = nullptr; // float3[n_warps * max_n]
+  void *d_smooth_warp_scores    = nullptr; // float[n_warps]
+  int smooth_warp_max_n = 0;
+  int smooth_n_warps    = 0;
+
   void init();
   void initArcsBuffers(int max_n, int max_warps, int max_loops);
   void initSmoothBuffers(int max_n);

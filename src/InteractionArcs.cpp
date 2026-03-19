@@ -56,6 +56,7 @@ void InteractionArcs::markArcs(bool ignore_missing) {
     std::sort(raw_arcs[chr].begin(), raw_arcs[chr].end());
 
     cnt = static_cast<int>(raw_arcs[chr].size());
+    int non_matching_count = 0;
 
     // we need i==cnt to process the remaining arcs
     for (int i = 0; i <= cnt; ++i) { // for every arc
@@ -72,8 +73,7 @@ void InteractionArcs::markArcs(bool ignore_missing) {
         }
 
         if ((st == -1 || end == -1)) {
-          printf("! error: non-matching arc\n");
-          raw_arcs[chr][i].print();
+          ++non_matching_count;
           continue;
         }
 
@@ -150,6 +150,9 @@ void InteractionArcs::markArcs(bool ignore_missing) {
         tmp_arcs[end].push_back(arc);
       }
     }
+
+    if (non_matching_count > 0)
+      printf("  %d non-matching arcs skipped\n", non_matching_count);
 
     arcs_cnt[chr] = static_cast<int>(arcs[chr].size()); // update count
     tmp_arcs.clear();

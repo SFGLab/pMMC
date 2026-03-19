@@ -153,6 +153,17 @@ void GpuResourceCache::initSmoothBuffers(int max_n) {
   cudaMalloc(&d_smooth_positions, (size_t)max_n * sizeof(float3));
   cudaMalloc(&d_smooth_fixed, (size_t)max_n * sizeof(bool));
   cudaMalloc(&d_smooth_dist, (size_t)max_n * sizeof(float));
+
+  /* Reallocate per-warp buffers for multi-warp smooth kernel */
+  int n_warps = sm_count > 0 ? sm_count : 46;
+  if (max_n > smooth_warp_max_n || n_warps > smooth_n_warps) {
+    if (d_smooth_warp_positions) cudaFree(d_smooth_warp_positions);
+    if (d_smooth_warp_scores)    cudaFree(d_smooth_warp_scores);
+    smooth_warp_max_n = max_n;
+    smooth_n_warps    = n_warps;
+    cudaMalloc(&d_smooth_warp_positions, (size_t)n_warps * max_n * sizeof(float3));
+    cudaMalloc(&d_smooth_warp_scores,    (size_t)n_warps * sizeof(float));
+  }
 }
 
 void GpuResourceCache::cleanup() {
@@ -170,12 +181,16 @@ void GpuResourceCache::cleanup() {
   if (d_smooth_positions) { cudaFree(d_smooth_positions); d_smooth_positions = nullptr; }
   if (d_smooth_fixed) { cudaFree(d_smooth_fixed); d_smooth_fixed = nullptr; }
   if (d_smooth_dist) { cudaFree(d_smooth_dist); d_smooth_dist = nullptr; }
+  if (d_smooth_warp_positions) { cudaFree(d_smooth_warp_positions); d_smooth_warp_positions = nullptr; }
+  if (d_smooth_warp_scores) { cudaFree(d_smooth_warp_scores); d_smooth_warp_scores = nullptr; }
   arcs_states_seeded = false;
   smooth_states_seeded = false;
   arcs_max_n = 0;
   arcs_max_warps = 0;
   arcs_max_loops = 0;
   smooth_max_n = 0;
+  smooth_warp_max_n = 0;
+  smooth_n_warps = 0;
   initialized = false;
 }
 
@@ -233,28 +248,34 @@ __device__ __forceinline__ float3 arcs_random_vector(float max_size, bool in2D,
  *   exp_dist[row * n + col]
  *
  * Semantics (matching CPU calcScoreDistancesActiveRegion):
- *   < 0       → repulsion (no direct arc) — we skip repulsion for GPU
- *               simplicity; the dominant term is arc-distance pairs.
+ *   < 0       → repulsion (no direct arc) — add 1/dist penalty to prevent
+ *               non-connected beads from collapsing together.
  *   [0, 1e-6) → ignored (diagonal or zero arc)
  *   >= 1e-6   → arc pair, penalise deviation from expected distance
  *
  * The work is split across the warp: each thread handles a stride of
  * positions, then results are reduced.
  * ====================================================================== */
+/* Per-bead arc score for LOCAL (incremental) scoring — NO repulsion.
+ * Matches CPU calcScoreDistancesActiveRegion(int cluster_moved) where
+ * negative expected distances are skipped (repulsion commented out).
+ * Float precision for GPU performance (64x faster on consumer GPUs). */
 __device__ float arcs_score_bead(int bead_idx, int n, float3 bead_pos,
                                   const float3 *__restrict__ positions,
                                   const float *__restrict__ exp_dist_mat,
                                   float stretch_k, float squeeze_k,
                                   int lane) {
   float sc = 0.0f;
-  /* Each lane of the warp handles every 32nd pair. */
   for (int j = lane; j < n; j += 32) {
     if (j == bead_idx)
       continue;
 
     float ed = exp_dist_mat[bead_idx * n + j];
+
+    /* Negative or near-zero expected distance → skip in local score
+     * (matches CPU where per-bead repulsion is commented out). */
     if (ed < 1e-6f)
-      continue; /* no arc or zero — skip (negative values mean no arc) */
+      continue;
 
     float3 pj = positions[j];
     float dx = bead_pos.x - pj.x;
@@ -288,20 +309,18 @@ __device__ float arcs_loop_score_bead(int bead_idx,
 
     float3 pi = positions[ai];
     float3 pj = positions[aj];
-    /* If this bead is the moved one, its current pos is in positions[] already
-     * (caller updates the position array before scoring). */
     float dx = pi.x - pj.x;
     float dy = pi.y - pj.y;
     float dz = pi.z - pj.z;
     float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-    float delta = dist - loop_params[k].y; /* dist - eq_distance */
-    sc += loop_params[k].x * delta * delta; /* stiffness * delta^2 */
+    float delta = dist - loop_params[k].y;
+    sc += loop_params[k].x * delta * delta;
   }
   return sc;
 }
 
 /* ======================================================================
- * Warp-level float reduction (sum across all 32 lanes).
+ * Warp-level reductions (sum across all 32 lanes).
  * ====================================================================== */
 #define FULL_WARP_MASK 0xffffffffu
 
@@ -310,6 +329,23 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   for (int offset = 16; offset > 0; offset >>= 1)
     v += __shfl_down_sync(FULL_WARP_MASK, v, offset);
   return v; /* result valid in lane 0 */
+}
+
+/* Double-precision warp reduce: shuffle the two 32-bit halves. */
+__device__ __forceinline__ double warp_reduce_sum_d(double v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    int lo = __shfl_down_sync(FULL_WARP_MASK, __double2loint(v), offset);
+    int hi = __shfl_down_sync(FULL_WARP_MASK, __double2hiint(v), offset);
+    v += __hiloint2double(hi, lo);
+  }
+  return v;
+}
+
+__device__ __forceinline__ double warp_broadcast_d(double v, int src) {
+  int lo = __shfl_sync(FULL_WARP_MASK, __double2loint(v), src);
+  int hi = __shfl_sync(FULL_WARP_MASK, __double2hiint(v), src);
+  return __hiloint2double(hi, lo);
 }
 
 /* ======================================================================
@@ -386,7 +422,7 @@ __global__ void MonteCarloArcsKernel(
   curandState localState = state[tid];
 
   /* ------------------------------------------------------------------
-   * SA state
+   * SA state — float precision (64x faster on consumer GPUs)
    * ------------------------------------------------------------------ */
   float T          = settings.maxTemp;
   float score_curr = 0.0f;
@@ -396,35 +432,45 @@ __global__ void MonteCarloArcsKernel(
   int   milestone_successes = 0;
   float milestone_score = 0.0f;
 
-  /* Compute initial total score (all lanes contribute). */
+  /* Compute initial total score (all lanes contribute).
+   * Includes repulsion for negative expected distances, matching CPU
+   * calcScoreDistancesActiveRegion() total score. */
   {
     float my_sc = 0.0f;
-    /* Each lane handles a subset of bead pairs to avoid double-counting.
-     * We sum over all beads: for each bead i (lane i%32), score vs all j>i. */
     for (int i = lane; i < n; i += 32) {
       for (int j = i + 1; j < n; j++) {
         float ed = exp_dist_mat[i * n + j];
-        if (ed < 1e-6f) continue;
         float3 pi = my_pos[i], pj = my_pos[j];
-        float dx = pi.x - pj.x, dy = pi.y - pj.y, dz = pi.z - pj.z;
+        float dx = pi.x - pj.x;
+        float dy = pi.y - pj.y;
+        float dz = pi.z - pj.z;
         float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+        /* Negative expected distance → repulsion (matches CPU total score). */
+        if (ed < 0.0f) {
+          my_sc += 1.0f / fmaxf(dist, 1e-6f);
+          continue;
+        }
+        if (ed < 1e-6f) continue;
+
         float diff = (dist - ed) / ed;
         my_sc += diff * diff *
-                 (diff >= 0.f ? settings.springConstantStretchArcs
-                              : settings.springConstantSqueezeArcs);
+                 (diff >= 0.0f ? settings.springConstantStretchArcs
+                               : settings.springConstantSqueezeArcs);
       }
     }
     /* Sum loop energy. */
     for (int k = lane; k < n_loops; k += 32) {
       int ai = loop_pairs[k].x, aj = loop_pairs[k].y;
       float3 pi = my_pos[ai], pj = my_pos[aj];
-      float dx = pi.x-pj.x, dy = pi.y-pj.y, dz = pi.z-pj.z;
-      float dist = sqrtf(dx*dx+dy*dy+dz*dz);
+      float dx = pi.x - pj.x;
+      float dy = pi.y - pj.y;
+      float dz = pi.z - pj.z;
+      float dist = sqrtf(dx*dx + dy*dy + dz*dz);
       float delta = dist - loop_params[k].y;
       my_sc += loop_params[k].x * delta * delta;
     }
     my_sc = warp_reduce_sum(my_sc);
-    /* Broadcast to all lanes. */
     score_curr = __shfl_sync(FULL_WARP_MASK, my_sc, 0);
     score_prev = score_curr;
     milestone_score = score_curr;
@@ -460,7 +506,7 @@ __global__ void MonteCarloArcsKernel(
       disp.y   = __shfl_sync(FULL_WARP_MASK, disp.y, 0);
       disp.z   = __shfl_sync(FULL_WARP_MASK, disp.z, 0);
 
-      /* ------ Score BEFORE move (local contribution of bead_idx). ------ */
+      /* ------ Score BEFORE move (local, no repulsion, float). ------ */
       float sc_before = 0.0f;
       {
         float my_sc = arcs_score_bead(bead_idx, n, my_pos[bead_idx],
@@ -496,7 +542,7 @@ __global__ void MonteCarloArcsKernel(
         sc_after = __shfl_sync(FULL_WARP_MASK, my_sc, 0);
       }
 
-      /* ------ Update total score incrementally. ------ */
+      /* ------ Update total score incrementally (float). ------ */
       float new_total = score_prev - sc_before + sc_after;
 
       /* ------ Metropolis acceptance (lane 0 decides, broadcasts). ------ */
@@ -538,7 +584,7 @@ __global__ void MonteCarloArcsKernel(
 
     iterations += ARCS_INNER_N;
 
-    /* ------ Milestone check (lane 0 only, for warp 0 sets isDone). ------ */
+    /* ------ Milestone check (matches CPU stopping logic). ------ */
     if (lane == 0) {
       bool no_improvement =
           (score_curr >
@@ -568,7 +614,7 @@ __global__ void MonteCarloArcsKernel(
    * ------------------------------------------------------------------ */
   if (lane == 0) {
     d_best_score[warp_id] = score_curr;
-    d_arcs_total_iterations = iterations; /* rough count; last-write wins */
+    d_arcs_total_iterations = iterations;
   }
   /* All lanes cooperate to copy local positions to output. */
   for (int i = lane; i < n; i += 32) {
@@ -584,18 +630,13 @@ __global__ void MonteCarloArcsKernel(
  * ====================================================================== */
 float LooperSolver::parallelMonteCarloArcs(float step_size) {
 
-  /* ------------------------------------------------------------------
-   * Basic size checks.
-   * ------------------------------------------------------------------ */
   int n = static_cast<int>(active_region.size());
   if (n <= 1)
     return 0.0f;
 
-  /* ------------------------------------------------------------------
-   * Rebuild loop map and check GPU availability.
-   * ------------------------------------------------------------------ */
   rebuildActiveLoopMap();
 
+  /* Initialize GPU cache; fall back to CPU if no CUDA device. */
   if (!gpu_cache.initialized) {
     gpu_cache.init();
     if (!gpu_cache.initialized) {
