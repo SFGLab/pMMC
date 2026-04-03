@@ -246,6 +246,10 @@ void HierarchicalChromosome::levelDown() {
       }
     }
 
+    // Sort by genomic position to ensure monotonic order for interpolation
+    std::sort(tmp.begin(), tmp.end(), [this](int a, int b) {
+      return clusters[a].genomic_pos < clusters[b].genomic_pos;
+    });
     current_level[chr] = tmp;
     tmp.clear();
   }
@@ -884,51 +888,89 @@ vector<int> HierarchicalChromosome::findFlankingAnchors(
 
 HierarchicalChromosome HierarchicalChromosome::extractFragment(int start,
                                                                int end) {
-
-  // TODO: update to genome
   HierarchicalChromosome hc;
 
-  //	useLowestLevel();
-  //
-  //	for (int i = 0; i < current_level.size(); ++i) {
-  //		if (clusters[current_level[i]].end < start ||
-  //clusters[current_level[i]].start > end) continue; // outside the range
-  //
-  //		hc.clusters.push_back(clusters[current_level[i]]);
-  //	}
-  //
-  //	Cluster r(hc.clusters[0].start, hc.clusters[hc.clusters.size()-1].end);
-  //	for (int i = 0; i < hc.clusters.size(); ++i) {
-  //		r.children.push_back(i);
-  //		hc.clusters[i].parent = hc.clusters.size();
-  //		hc.clusters[i].level = 1;
-  //	}
-  //
-  //
-  //	// update arcs
-  //	for (int i = 0; i < arcs.raw_arcs.size(); ++i) {
-  //
-  //		//printf("raw %d %d\n", raw_arcs[i].start, raw_arcs[i].end);
-  //		int st = -1, end = -1;
-  //		for (int j = 0; j < hc.clusters.size() && (st==-1||end==-1); ++j)
-  //{ 			if (hc.clusters[j].contains(arcs.raw_arcs[i].start)) st = j; 			if
-  //(hc.clusters[j].contains(arcs.raw_arcs[i].end)) end = j;
-  //		}
-  //
-  //		if (st != -1 && end != -1) {
-  //			//printf("new arc: %d %d\n", st, end);
-  //			hc.arcs.raw_arcs.push_back(arcs.raw_arcs[i]);
-  //
-  //			InteractionArc arc(st, end, arcs.raw_arcs[i].score,
-  //arcs.raw_arcs[i].factor); 			hc.arcs.arcs.push_back(arc);
-  //		}
-  //	}
-  //	hc.arcs.arcs_cnt = hc.arcs.arcs.size();
-  //	hc.arcs.factors = arcs.factors;
-  //
-  //	// add root
-  //	hc.root = hc.clusters.size();
-  //	hc.clusters.push_back(r);
+  // Go to the lowest level so we iterate over individual beads
+  useLowestLevel();
+
+  // If lowest level is empty, try walking up levels until we find beads
+  bool has_beads = false;
+  for (const std::string& c : chrs)
+    if (!current_level[c].empty()) { has_beads = true; break; }
+  if (!has_beads) {
+    // Reset and go to the deepest populated level
+    for (int lvl = 3; lvl >= 0; --lvl) {
+      setLevel(lvl);
+      for (const std::string& c : chrs)
+        if (!current_level[c].empty()) { has_beads = true; break; }
+      if (has_beads) break;
+    }
+  }
+
+  // Map from old cluster index to new cluster index
+  std::map<int, int> old_to_new;
+
+  // Collect beads in the genomic range from all chromosomes
+  std::string frag_chr;
+  for (const std::string& chr_name : chrs) {
+    for (int idx : current_level[chr_name]) {
+      if (clusters[idx].end < start || clusters[idx].start > end)
+        continue; // outside the range
+
+      int new_idx = (int)hc.clusters.size();
+      old_to_new[idx] = new_idx;
+      hc.clusters.push_back(clusters[idx]);
+      frag_chr = chr_name;
+    }
+  }
+
+  if (hc.clusters.empty())
+    return hc;
+
+  int n_beads = (int)hc.clusters.size();
+
+  // Create a root cluster spanning the fragment
+  Cluster root_cluster(hc.clusters[0].start,
+                       hc.clusters[n_beads - 1].end);
+  for (int i = 0; i < n_beads; ++i) {
+    root_cluster.children.push_back(i);
+    hc.clusters[i].parent = n_beads;
+    hc.clusters[i].level = 1;
+  }
+
+  int root_idx = n_beads;
+  hc.clusters.push_back(root_cluster);
+
+  // Set up chromosome tracking
+  if (!frag_chr.empty()) {
+    hc.chrs.push_back(frag_chr);
+    hc.chr_root[frag_chr] = root_idx;
+    for (int i = 0; i < n_beads; ++i)
+      hc.current_level[frag_chr].push_back(i);
+  }
+
+  // Copy arcs that fall within the extracted region
+  hc.arcs.factors = arcs.factors;
+  for (const std::string& chr_name : chrs) {
+    for (size_t i = 0; i < arcs.raw_arcs[chr_name].size(); ++i) {
+      const InteractionArc& raw = arcs.raw_arcs[chr_name][i];
+
+      // Find which new clusters contain the arc endpoints
+      int new_st = -1, new_en = -1;
+      for (int j = 0; j < n_beads && (new_st == -1 || new_en == -1); ++j) {
+        if (hc.clusters[j].contains(raw.start))
+          new_st = j;
+        if (hc.clusters[j].contains(raw.end))
+          new_en = j;
+      }
+
+      if (new_st != -1 && new_en != -1) {
+        hc.arcs.raw_arcs[frag_chr].push_back(raw);
+        InteractionArc arc(new_st, new_en, raw.score, raw.factor);
+        hc.arcs.arcs[frag_chr].push_back(arc);
+      }
+    }
+  }
 
   return hc;
 }
@@ -1227,52 +1269,181 @@ HierarchicalChromosome::gpuHelper(const int pos_start, const int pos_stop,
   // move to gpu
   std::vector<int> current_levels_h = current_level[chr_ind]; // index of i-th cluster
   const auto current_levels_size = current_levels_h.size();
-
-  float3 *clusters_positions, *out;
-  int *clusters_genomic_positions, *current_levels;
-  cudaMalloc(&clusters_positions, clusters.size() * sizeof(float3));
-  cudaMalloc(&clusters_genomic_positions, clusters.size() * sizeof(int));
-  cudaMalloc((int **)&current_levels, current_levels_h.size() * sizeof(int));
   const auto out_size = ((pos_stop - pos_start + 1) / resolution_bp + 1);
-  cudaMalloc(&out, out_size * sizeof(float3));
 
-  std::vector<float3> clusters_positions_h(clusters.size());
-  std::vector<int> clusters_genomic_positions_h(clusters.size());
+  // Query available GPU memory and attempt GPU path
+  size_t gpu_free = 0, gpu_total = 0;
+  cudaError_t mem_err = cudaMemGetInfo(&gpu_free, &gpu_total);
 
-  for (std::size_t i = 0; i < clusters.size(); ++i) {
-    clusters_genomic_positions_h[i] = clusters[i].genomic_pos;
-    clusters_positions_h[i].x = clusters[i].pos[0];
-    clusters_positions_h[i].y = clusters[i].pos[1];
-    clusters_positions_h[i].z = clusters[i].pos[2];
+  size_t needed = clusters.size() * sizeof(float3) + clusters.size() * sizeof(int)
+                + current_levels_h.size() * sizeof(int) + out_size * sizeof(float3);
+
+  bool use_gpu = (mem_err == cudaSuccess && gpu_free > needed * 2);
+
+  float3 *clusters_positions = nullptr, *out = nullptr;
+  int *clusters_genomic_positions = nullptr, *current_levels = nullptr;
+
+  if (use_gpu) {
+    cudaError_t e1 = cudaMalloc(&clusters_positions, clusters.size() * sizeof(float3));
+    cudaError_t e2 = cudaMalloc(&clusters_genomic_positions, clusters.size() * sizeof(int));
+    cudaError_t e3 = cudaMalloc((void **)&current_levels, current_levels_h.size() * sizeof(int));
+    cudaError_t e4 = cudaMalloc(&out, out_size * sizeof(float3));
+
+    if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess || e4 != cudaSuccess) {
+      printf("[gpuHelper] GPU allocation failed (needed %.1f MB, free %.1f MB). Falling back to CPU.\n",
+             needed / 1e6, gpu_free / 1e6);
+      if (clusters_positions) cudaFree(clusters_positions);
+      if (clusters_genomic_positions) cudaFree(clusters_genomic_positions);
+      if (current_levels) cudaFree(current_levels);
+      if (out) cudaFree(out);
+      cudaGetLastError(); // clear error state
+      use_gpu = false;
+    }
   }
 
-  cudaMemcpy(clusters_positions, &clusters_positions_h[0],
-             clusters.size() * sizeof(float3), cudaMemcpyHostToDevice);
-  cudaMemcpy(clusters_genomic_positions, &clusters_genomic_positions_h[0],
-             clusters.size() * sizeof(int), cudaMemcpyHostToDevice);
-  cudaMemcpy(current_levels, current_levels_h.data(),
-             current_levels_h.size() * sizeof(int), cudaMemcpyHostToDevice);
+  if (use_gpu) {
+    std::vector<float3> clusters_positions_h(clusters.size());
+    std::vector<int> clusters_genomic_positions_h(clusters.size());
 
-  gpuErrchk(cudaDeviceSynchronize());
+    for (std::size_t i = 0; i < clusters.size(); ++i) {
+      clusters_genomic_positions_h[i] = clusters[i].genomic_pos;
+      clusters_positions_h[i].x = clusters[i].pos[0];
+      clusters_positions_h[i].y = clusters[i].pos[1];
+      clusters_positions_h[i].z = clusters[i].pos[2];
+    }
 
-  parallelFind3DSmoothPosition<<<1024, 100>>>(
-      pos_start, pos_stop, resolution_bp, size, p1, p2, p1_end, p2_start,
-      current_levels, current_levels_size, clusters_genomic_positions,
-      clusters_positions, out
-  );
+    cudaMemcpy(clusters_positions, &clusters_positions_h[0],
+               clusters.size() * sizeof(float3), cudaMemcpyHostToDevice);
+    cudaMemcpy(clusters_genomic_positions, &clusters_genomic_positions_h[0],
+               clusters.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(current_levels, current_levels_h.data(),
+               current_levels_h.size() * sizeof(int), cudaMemcpyHostToDevice);
 
-  gpuErrchk(cudaPeekAtLastError());
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+      printf("[gpuHelper] GPU sync failed: %s. Falling back to CPU.\n",
+             cudaGetErrorString(sync_err));
+      cudaFree(clusters_positions);
+      cudaFree(clusters_genomic_positions);
+      cudaFree((void *)out);
+      cudaFree((void *)current_levels);
+      cudaGetLastError();
+      use_gpu = false;
+    }
+  }
 
-  gpuErrchk(cudaDeviceSynchronize());
+  if (use_gpu) {
+    // Cap grid size to output size to avoid launching excess threads
+    int grid_blocks = std::min(1024, (int)((out_size + 99) / 100));
+    parallelFind3DSmoothPosition<<<grid_blocks, 100>>>(
+        pos_start, pos_stop, resolution_bp, size, p1, p2, p1_end, p2_start,
+        current_levels, current_levels_size, clusters_genomic_positions,
+        clusters_positions, out
+    );
 
-  // copy results back
+    cudaError_t kern_err = cudaPeekAtLastError();
+    if (kern_err != cudaSuccess) {
+      printf("[gpuHelper] Kernel launch failed: %s. Falling back to CPU.\n",
+             cudaGetErrorString(kern_err));
+      cudaFree(clusters_positions);
+      cudaFree(clusters_genomic_positions);
+      cudaFree((void *)out);
+      cudaFree((void *)current_levels);
+      cudaGetLastError();
+      use_gpu = false;
+    } else {
+      cudaError_t sync_err2 = cudaDeviceSynchronize();
+      if (sync_err2 != cudaSuccess) {
+        printf("[gpuHelper] Kernel execution failed: %s. Falling back to CPU.\n",
+               cudaGetErrorString(sync_err2));
+        cudaFree(clusters_positions);
+        cudaFree(clusters_genomic_positions);
+        cudaFree((void *)out);
+        cudaFree((void *)current_levels);
+        cudaGetLastError();
+        use_gpu = false;
+      } else {
+        // Success: copy results back
+        ret = std::vector<float3>(out_size);
+        cudaMemcpy(ret.value().data(), out, out_size * sizeof(float3),
+                   cudaMemcpyDeviceToHost);
+        cudaFree(clusters_positions);
+        cudaFree(clusters_genomic_positions);
+        cudaFree((void *)out);
+        cudaFree((void *)current_levels);
+        return ret;
+      }
+    }
+  }
+
+  // CPU fallback: streaming interpolation without GPU
+  printf("[gpuHelper] Using CPU interpolation for %d output points.\n", (int)out_size);
   ret = std::vector<float3>(out_size);
-  cudaMemcpy(ret.value().data(), out, out_size * sizeof(float3),
-             cudaMemcpyDeviceToHost);
-  cudaFree(clusters_positions);
-  cudaFree(clusters_genomic_positions);
-  cudaFree((void *)out);
-  cudaFree((void *)current_levels);
+  auto &result = ret.value();
+
+  for (int idx = 0; idx < (int)out_size; ++idx) {
+    long long pos = pos_start + (long long)resolution_bp * idx;
+
+    if (pos < p1_end) {
+      result[idx].x = clusters[p1].pos[0];
+      result[idx].y = clusters[p1].pos[1];
+      result[idx].z = clusters[p1].pos[2];
+      continue;
+    }
+    if (pos >= p2_start) {
+      result[idx].x = clusters[p2].pos[0];
+      result[idx].y = clusters[p2].pos[1];
+      result[idx].z = clusters[p2].pos[2];
+      continue;
+    }
+
+    int prev_p = -1;
+    bool found = false;
+    for (size_t i = 0; i < current_levels_size; ++i) {
+      int p = current_levels_h[i];
+      if (pos < clusters[p].genomic_pos && prev_p >= 0) {
+        // Catmull-Rom spline interpolation (same as GPU kernel)
+        float3 pp1, pp2, pp0, pp3;
+        pp1.x = clusters[prev_p].pos[0]; pp1.y = clusters[prev_p].pos[1]; pp1.z = clusters[prev_p].pos[2];
+        pp2.x = clusters[p].pos[0]; pp2.y = clusters[p].pos[1]; pp2.z = clusters[p].pos[2];
+
+        if (i > 1) {
+          int pi = current_levels_h[i - 2];
+          pp0.x = clusters[pi].pos[0]; pp0.y = clusters[pi].pos[1]; pp0.z = clusters[pi].pos[2];
+        } else {
+          // mirror
+          pp0.x = 2.0f * pp1.x - pp2.x; pp0.y = 2.0f * pp1.y - pp2.y; pp0.z = 2.0f * pp1.z - pp2.z;
+        }
+
+        if (i + 1 < current_levels_size) {
+          int pi = current_levels_h[i + 1];
+          pp3.x = clusters[pi].pos[0]; pp3.y = clusters[pi].pos[1]; pp3.z = clusters[pi].pos[2];
+        } else {
+          pp3.x = 2.0f * pp2.x - pp1.x; pp3.y = 2.0f * pp2.y - pp1.y; pp3.z = 2.0f * pp2.z - pp1.z;
+        }
+
+        float t = (float)(pos - clusters[prev_p].genomic_pos) /
+                  (float)(clusters[p].genomic_pos - clusters[prev_p].genomic_pos);
+        float t2 = t * t, t3 = t2 * t;
+        float b1 = 0.5f * (-t3 + 2.0f * t2 - t);
+        float b2 = 0.5f * (3.0f * t3 - 5.0f * t2 + 2.0f);
+        float b3 = 0.5f * (-3.0f * t3 + 4.0f * t2 + t);
+        float b4 = 0.5f * (t3 - t2);
+
+        result[idx].x = pp0.x * b1 + pp1.x * b2 + pp2.x * b3 + pp3.x * b4;
+        result[idx].y = pp0.y * b1 + pp1.y * b2 + pp2.y * b3 + pp3.y * b4;
+        result[idx].z = pp0.z * b1 + pp1.z * b2 + pp2.z * b3 + pp3.z * b4;
+        found = true;
+        break;
+      }
+      prev_p = p;
+    }
+    if (!found && prev_p >= 0) {
+      result[idx].x = clusters[prev_p].pos[0];
+      result[idx].y = clusters[prev_p].pos[1];
+      result[idx].z = clusters[prev_p].pos[2];
+    }
+  }
 
   return ret;
 }

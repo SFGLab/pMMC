@@ -12,7 +12,7 @@
 
 #include <time.h>
 
-#include <LooperSolver.h>
+#include <LooperSolver.hpp>
 
 #include <cuda_fp16.h>
 
@@ -45,7 +45,20 @@ struct gpu_settings {
   float tempJumpCoefHeatmap;
   float tempJumpScaleHeatmap;
   int milestoneFailsThreshold;
+  float3 sphere_center;
+  float sphere_radius;
 };
+
+__device__ __forceinline__ float sphereBoundaryPenalty(float3 pos, float3 center, float radius) {
+    if (radius <= 0.0f) return 0.0f;
+    float dx = pos.x - center.x;
+    float dy = pos.y - center.y;
+    float dz = pos.z - center.z;
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (dist <= radius) return 0.0f;
+    float overshoot = dist - radius;
+    return overshoot * overshoot;
+}
 
 struct __align__(8) half3 {
   __half x;
@@ -246,6 +259,16 @@ __global__ void MonteCarloHeatmapKernel(
           heatmap_dist, heatmapSize, heatmapDiagonalSize, activeRegionSize,
           chromosomeBoundariesSize, curr_vector, warpIdx);
 
+      // Sphere boundary penalty (convert half3 to float3 for full precision)
+      {
+        float3 pos_f;
+        pos_f.x = __half2float(curr_vector.x);
+        pos_f.y = __half2float(curr_vector.y);
+        pos_f.z = __half2float(curr_vector.z);
+        score_curr += sphereBoundaryPenalty(pos_f, settings.sphere_center,
+                                            settings.sphere_radius);
+      }
+
       if ((score_curr <= score_prev) ||
           (T > 0.0f &&
            withChance(settings.tempJumpScaleHeatmap *
@@ -343,6 +366,14 @@ float LooperSolver::ParallelMonteCarloHeatmap(float step_size) {
   int threads = Settings::cudaThreadsPerBlock;
   int blocks = static_cast<int>(Settings::cudaBlocksMultiplier * active_region.size());
 
+  // When a deterministic seed is provided (-j flag), limit to a single warp
+  // (32 threads) to eliminate inter-warp races on shared position updates.
+  // This trades GPU parallelism for exact reproducibility.
+  if (Settings::gpuSeed != 0) {
+    threads = 32;
+    blocks = 1;
+  }
+
   double T = Settings::maxTempHeatmap; // set current temperature to max
   double score_curr;
   double score_density;
@@ -385,6 +416,8 @@ float LooperSolver::ParallelMonteCarloHeatmap(float step_size) {
   settings.MCstopConditionImprovementHeatmap =
       Settings::MCstopConditionImprovementHeatmap;
   settings.milestoneFailsThreshold = Settings::milestoneFailsThreshold;
+  settings.sphere_center = make_float3(0.0f, 0.0f, 0.0f);
+  settings.sphere_radius = Settings::sphere_radius;
 
   thrust::host_vector<bool> h_clusters_fixed(active_region.size());
   thrust::host_vector<half3> h_clusters_positions_half(active_region.size());

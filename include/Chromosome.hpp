@@ -1,0 +1,837 @@
+/**
+ * @file Chromosome.hpp
+ * @brief 3D polymer structure representing a chromosome or fragment thereof.
+ *
+ * Stores a sequence of 3D points (beads), supports alignment, RMSD calculation,
+ * heatmap generation, and various geometric operations. This is the primary
+ * output structure at each level of the hierarchy.
+ *
+ * @see HierarchicalChromosome for the multi-level container.
+ */
+
+#ifndef CHROMOSOME_H_
+#define CHROMOSOME_H_
+
+#include <string.h>
+#include <vector>
+
+#include <locale>
+
+#include <common.h>
+#include <rmsd.h>
+#include <Heatmap.hpp>
+#include <Settings.hpp>
+
+using namespace std;
+
+/**
+ * @class Chromosome
+ * @brief A 3D bead-chain polymer model of a chromosome (or sub-region).
+ *
+ * The points vector stores the 3D coordinates of each bead.
+ * Genomic positions can be stored in genomic_position.
+ * Supports I/O (binary, PDB), random generation, alignment via
+ * Procrustes rotation, and conversion to/from heatmaps.
+ */
+class Chromosome {
+
+public:
+  /** @brief Default constructor (empty structure). */
+  Chromosome();
+
+  /** @brief Reset all fields. */
+  void init();
+
+  /** @brief Print structure summary to stdout. */
+  void print();
+
+  /**
+   * @brief Write structure to a binary file.
+   * @param filename Output file path.
+   */
+  void toFile(string filename);
+
+  /**
+   * @brief Write structure to an already-open file handle.
+   * @param file Open FILE pointer.
+   */
+  void toFile(FILE *file);
+
+  /**
+   * @brief Read structure from a binary file.
+   * @param filename Input file path.
+   */
+  void fromFile(string filename);
+
+  /**
+   * @brief Read structure from an already-open file handle.
+   * @param file Open FILE pointer.
+   * @param pts_cnt Number of points to read (0 = read from file header).
+   */
+  void fromFile(FILE *file, int pts_cnt = 0);
+
+  /**
+   * @brief Read structure from a PDB file.
+   * @param filename Path to PDB file.
+   */
+  void fromFilePDB(string filename);
+
+  /**
+   * @brief Generate a random polymer structure.
+   * @param pts_cnt Number of beads.
+   * @param size Step size for random walk.
+   * @param walk If true, use random walk; if false, place randomly.
+   */
+  void createRandom(int pts_cnt, float size = 0.1f, bool walk = true);
+
+  /**
+   * @brief Create a straight-line structure.
+   * @param pts_cnt Number of beads.
+   * @param dist Distance between consecutive beads.
+   */
+  void makeLine(int pts_cnt, float dist);
+
+  /**
+   * @brief Create a helical (spiral) structure.
+   * @param pts_cnt Number of beads.
+   * @param r Helix radius.
+   * @param angle Angular step per bead (radians).
+   * @param spin_height Height increment per revolution.
+   */
+  void makeSpiral(int pts_cnt, float r, float angle, float spin_height);
+
+  /**
+   * @brief Create a spiral between two endpoints.
+   * @param pts_cnt Number of beads.
+   * @param r Helix radius.
+   * @param angle Angular step per bead.
+   * @param p1 Start point.
+   * @param p2 End point.
+   */
+  void makeSpiral(int pts_cnt, float r, float angle, vector3 p1, vector3 p2);
+
+  /**
+   * @brief Assemble this chromosome from a list of sub-chromosomes.
+   * @param chrs Vector of sub-chromosome structures to concatenate.
+   */
+  void createFromSubchromosomes(const vector<Chromosome> &chrs);
+
+  /**
+   * @brief Randomize positions of sub-chromosome fragments.
+   * @param dispersion Amount of random displacement.
+   * @param keep_subchr_structure If true, preserve internal sub-chromosome geometry.
+   */
+  void randomizeSubchromosomes(float dispersion,
+                               bool keep_subchr_structure = true);
+
+  /**
+   * @brief Assign sub-chromosome membership indices to beads.
+   * @param subchr_index Vector mapping each bead to its sub-chromosome index.
+   */
+  void setSubchromosomesIndices(const vector<int> &subchr_index);
+
+  /**
+   * @brief Create a deep copy of this chromosome.
+   * @return A new Chromosome with copied data.
+   */
+  Chromosome clone();
+
+  /** @brief Translate the structure so its center of mass is at the origin. */
+  void center();
+
+  /**
+   * @brief Scale all coordinates by a factor.
+   * @param scale Scale factor.
+   * @param center If true, center the structure first.
+   */
+  void scale(float scale, bool center = false);
+
+  /**
+   * @brief Create a contact-frequency heatmap from pairwise 3D distances.
+   * @return Heatmap where h[i][j] ~ 1/dist(i,j).
+   */
+  Heatmap createHeatmap();
+
+  /**
+   * @brief Create an inverse heatmap (simulated "inverse Hi-C").
+   * @return Heatmap with distance-based values.
+   */
+  Heatmap createInverseHeatmap();
+
+  /**
+   * @brief Align this structure to a reference by Procrustes rotation.
+   * @param chr Reference chromosome to align to.
+   * @param resize If true, allow scaling during alignment.
+   * @param max_angle Maximum rotation angle (radians, default 2*pi).
+   */
+  void align(const Chromosome &chr, bool resize = false,
+             float max_angle = 2 * 3.14f);
+
+  /**
+   * @brief Rescale this structure to match the size of a reference.
+   * @param chr Reference chromosome.
+   */
+  void adjustSize(const Chromosome &chr);
+
+  /** @brief Recompute the size field from the points array. */
+  void updateSize();
+
+  /**
+   * @brief Compute the sum of squared distances to another structure.
+   * @param chr Other chromosome (must have same number of points).
+   * @return Sum of squared distances between corresponding beads.
+   */
+  float getDistanceSqr(const Chromosome &chr);
+
+  /**
+   * @brief Compute the center of mass.
+   * @return 3D center of mass vector.
+   */
+  vector3 getCenter();
+
+  /**
+   * @brief Translate all points by a vector.
+   * @param v Translation vector.
+   */
+  void translate(const vector3 &v);
+
+  /**
+   * @brief Rotate all points by a 4x4 transformation matrix.
+   * @param mat Rotation/transformation matrix.
+   */
+  void rotate(const matrix44 &mat);
+
+  /**
+   * @brief Compute the diameter (maximum pairwise distance).
+   * @return Diameter in spatial units.
+   */
+  float getDiameter() const;
+
+  /**
+   * @brief Get distances between consecutive beads.
+   * @return Vector of distances: dist(point[i], point[i+1]).
+   */
+  std::vector<float> getConsecutiveBeadDistances();
+
+  /**
+   * @brief Average distance between consecutive beads.
+   * @return Mean of getConsecutiveBeadDistances().
+   */
+  float getAvgConsecutiveBeadDistance();
+
+  /**
+   * @brief Average Euclidean distance to another structure.
+   * @param chr Other chromosome.
+   * @return Mean distance across corresponding bead pairs.
+   */
+  float calcDistance(const Chromosome &chr);
+
+  /**
+   * @brief Root-mean-square deviation to another structure.
+   * @param chr Other chromosome (must have same size).
+   * @return RMSD value.
+   */
+  float calcRMSD(const Chromosome &chr);
+
+  /**
+   * @brief Calculate base density (number of beads within a sphere around each bead).
+   * @param sphere_r Sphere radius (0 = use default from settings).
+   * @return 2D vector: [bead_index][density_values].
+   */
+  vector<vector<float>> calcBaseDensity(float sphere_r = 0.0f);
+
+  /**
+   * @brief Trim the structure to a sub-range of beads.
+   * @param start First bead index to keep.
+   * @param end Last bead index to keep (0 = keep to the end).
+   */
+  void trim(int start, int end = 0);
+
+  int size;  /**< Number of beads (points). */
+
+  vector<vector3> points;              /**< 3D coordinates of each bead. */
+  vector<int> genomic_position;        /**< Genomic position (bp) per bead. */
+  vector<vector<vector3>> points_hierarchical;  /**< Multi-level bead positions for visualization. */
+
+  float score;  /**< Energy score from the last Monte Carlo optimization. */
+
+private:
+  /**
+   * @brief Grid search for the best alignment rotation.
+   * @param chr Reference chromosome.
+   * @param steps Number of angular steps per axis.
+   * @param angle Best rotation angles (output).
+   * @param max_angle Maximum rotation angle.
+   * @return Minimum distance after rotation.
+   */
+  float findBestAlignmentRotation(const Chromosome &chr, int steps,
+                                  vector3 &angle, float max_angle);
+
+  /**
+   * @brief Find the pair of points with the largest distance.
+   * @param dist Output: the maximum distance found.
+   * @return Index of one of the two most distant points.
+   */
+  int getMostDistantPointsPair(float &dist);
+};
+
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+
+inline Chromosome::Chromosome() {
+  size = 0;
+  score = 0.0f;
+}
+
+inline void Chromosome::init() {
+  points.clear();
+  genomic_position.clear();
+  size = 0;
+}
+
+inline void Chromosome::print() {
+  for (int i = 0; i < size; i++)
+    printf("(%f %f %f)\n", points[i].x, points[i].y, points[i].z);
+  printf("\n");
+}
+
+inline void Chromosome::updateSize() { size = static_cast<int>(points.size()); }
+
+inline void Chromosome::scale(float scale, bool center) {
+  if (center)
+    this->center();
+  for (int i = 0; i < size; ++i) {
+    points[i] *= scale;
+  }
+}
+
+inline void Chromosome::fromFile(string filename) {
+  FILE *f = open(filename, "r");
+  if (f == NULL)
+    return;
+
+  int pts_cnt = 0;
+
+  char line[32];
+  if (fgets(line, 32, f) == NULL)
+    return;
+  fseek(f, 0, 0);
+
+  int args = countWords(line);
+  if (args == 1) {
+    fscanf(f, "%d", &pts_cnt);
+    this->fromFile(f, pts_cnt);
+  } else if (args == 3) {
+    this->fromFile(f, -1);
+  } else {
+    fclose(f);
+    error("Unrecognized format. First line should contain the size or 3D "
+          "coordinates");
+  }
+
+  fclose(f);
+}
+
+inline float Chromosome::findBestAlignmentRotation(const Chromosome &chr, int steps,
+                                            vector3 &angle, float max_angle) {
+  float step = max_angle / (steps - 1);
+  float d_ang = max_angle / -2.0f;
+
+  matrix44 m;
+  float min_dist = 1e12f, dist;
+  for (int ix = 0; ix < steps; ++ix) {
+    for (int iy = 0; iy < steps; ++iy) {
+      for (int iz = 0; iz < steps; ++iz) {
+        m = RotateRadMatrix44('x', step * ix - d_ang);
+        m = m * RotateRadMatrix44('y', step * iy - d_ang);
+        m = m * RotateRadMatrix44('z', step * iz - d_ang);
+
+        Chromosome ch = clone();
+        ch.rotate(m);
+
+        dist = ch.getDistanceSqr(chr);
+        // printf("%d %d %d %f\n", ix, iy, iz, dist);
+        if (dist < min_dist) {
+          // printf("  ! %f %f      %f %d %f\n", dist, min_dist, step, ix,
+          // step*ix);
+          min_dist = dist;
+          angle.x = step * ix;
+          angle.y = step * iy;
+          angle.z = step * iz;
+        }
+      }
+    }
+  }
+
+  return min_dist;
+}
+
+inline void Chromosome::adjustSize(const Chromosome &chr) {
+
+  float score;
+  Chromosome chr_tmp;
+
+  float low = 1e-6f, high = 1e2f, dscale;
+  float sc, prev_sc;
+  bool sign_change;
+
+  while (high - low > 1e-6) {
+
+    if (low < 0.0f)
+      low = 1e-6f;
+    dscale = (high - low) / 7;
+
+    sign_change = false;
+    score = chr_tmp.calcDistance(chr);
+    prev_sc = score;
+    for (int i = 0; i < 8; ++i) {
+      sc = low + dscale * i;
+      chr_tmp = this->clone();
+      chr_tmp.scale(sc);
+      score = chr_tmp.calcDistance(chr);
+      if (score > prev_sc) { // start to raise
+        // modify range
+        low = low + dscale * (i - 2);
+        high = sc;
+        sign_change = true;
+        break;
+      }
+      prev_sc = score;
+    }
+
+    if (!sign_change) {
+      // values are decreasing, we need to expand range to the right
+      low = high - dscale;
+      high = high + dscale;
+    }
+  }
+
+  scale(low);
+}
+
+inline void Chromosome::align(const Chromosome &chr, bool resize, float max_angle) {
+  int steps = 50;
+
+  // center();
+
+  vector3 angle(0.0f, 0.0f, 0.0f);
+
+  if (resize)
+    adjustSize(chr);
+
+  findBestAlignmentRotation(chr, steps, angle, max_angle);
+
+  matrix44 m = RotateRadMatrix44('x', angle.x);
+  m = m * RotateRadMatrix44('y', angle.y);
+  m = m * RotateRadMatrix44('z', angle.z);
+  rotate(m);
+}
+
+inline float Chromosome::getDistanceSqr(const Chromosome &chr) {
+  float dist = 0.0f;
+  for (int i = 0; i < size; i++) {
+    dist += (points[i].x - chr.points[i].x) * (points[i].x - chr.points[i].x);
+    dist += (points[i].y - chr.points[i].y) * (points[i].y - chr.points[i].y);
+    dist += (points[i].z - chr.points[i].z) * (points[i].z - chr.points[i].z);
+  }
+  return dist / size;
+}
+
+inline void Chromosome::translate(const vector3 &v) {
+  for (int i = 0; i < size; i++)
+    points[i] += v;
+}
+
+inline void Chromosome::rotate(const matrix44 &mat) {
+  for (int i = 0; i < size; i++)
+    points[i] = points[i] * mat;
+}
+
+inline vector3 Chromosome::getCenter() {
+  vector3 center(0.0f, 0.0f, 0.0f);
+  for (int i = 0; i < size; i++)
+    center += points[i];
+  return center / static_cast<float>(size);
+}
+
+inline void Chromosome::center() {
+  vector3 center = getCenter();
+  print_vector(center, "center");
+  for (int i = 0; i < size; i++)
+    points[i] -= center;
+}
+
+inline Chromosome Chromosome::clone() {
+  Chromosome ch;
+  ch.points = points;
+  ch.points_hierarchical = points_hierarchical;
+  ch.score = score;
+  ch.size = size;
+  return ch;
+}
+
+inline Heatmap Chromosome::createHeatmap() {
+  Heatmap h(size);
+  float d;
+  for (int i = 0; i < size; ++i) {
+    for (int l = i + 1; l < size; ++l) {
+      d = dist(points[i], points[l]);
+      h.v[i][l] = d;
+      h.v[l][i] = h.v[i][l];
+    }
+  }
+  return h;
+}
+
+inline Heatmap Chromosome::createInverseHeatmap() {
+  Heatmap h(size);
+  float d;
+  for (int i = 0; i < size; ++i) {
+    for (int l = i + 1; l < size; ++l) {
+      d = dist(points[i], points[l]);
+      // h.v[i][l] = 1.0f / pow(d, Settings::;
+      h.v[i][l] = 1.0f / d;
+      h.v[l][i] = h.v[i][l];
+    }
+  }
+  return h;
+}
+
+inline void Chromosome::createRandom(int pts_cnt, float size, bool walk) {
+  vector3 v(0.0, 0.0, 0.0);
+  points.clear();
+  for (int i = 0; i < pts_cnt; i++) {
+    points.push_back(v);
+    if (walk)
+      v = displace(v, size);
+    else
+      v = random_vector(size);
+  }
+  this->size = pts_cnt;
+}
+
+inline void Chromosome::makeLine(int pts_cnt, float dist) {
+  vector3 v(0.0f, 0.0f, 0.0f);
+  for (int i = 0; i < pts_cnt; ++i) {
+    v.x += dist;
+    points.push_back(v);
+  }
+  center();
+  size = pts_cnt;
+}
+
+inline void Chromosome::makeSpiral(int pts_cnt, float r, float angle,
+                            float spin_height) {
+
+  init();
+  vector3 v(0.0f, 0.0f, 0.0f);
+
+  float alpha = 0.0f;
+
+  for (int i = 0; i < pts_cnt; i++) {
+    v.x = r * cos(alpha);
+    v.z = r * sin(alpha);
+    v.y += spin_height;
+    alpha += angle;
+    points.push_back(v);
+  }
+  size = pts_cnt;
+}
+
+inline void Chromosome::makeSpiral(int pts_cnt, float r, float angle, vector3 p1,
+                            vector3 p2) {
+
+  // we do as in 'normal', axis-oriented spring, but we use vectors
+  // perpendicular to p1-p2 axis
+
+  vector3 dir = p2 - p1; // direction of vector
+  vector3 axis1(-dir.y, dir.x, 0.0f);
+  if (fabs(axis1.x) < 1e-6 && fabs(axis1.y) < 1e-6)
+    axis1.x = -dir.z;
+  axis1 = Normalized(axis1);
+  vector3 axis2 = Normalized(CrossProduct(Normalized(dir), axis1));
+
+  // print_vector(dir, "dir");
+  // print_vector(axis1, "a1");
+  // print_vector(axis2, "a2");
+
+  init();
+
+  vector3 v(0.0f, 0.0f, 0.0f);
+
+  float alpha = 0.0f;
+  float t = 0.0f;
+  float dt = 1.0f / (pts_cnt - 1);
+
+  // correction
+  vector3 d1 = r * cos(0.0f) * axis1 + r * sin(0.0f) * axis2;
+  float ang = alpha + angle * (pts_cnt - 1);
+  vector3 d2 = r * cos(ang) * axis1 + r * sin(ang) * axis2;
+
+  // print_vector(d1, "corr1");
+  // print_vector(d2, "corr2");
+
+  for (int i = 0; i < pts_cnt; i++) {
+    v = p1 + dir * t + r * cos(alpha) * axis1 + r * sin(alpha) * axis2;
+    v = v - (1.0f - t) * d1 - t * d2;
+    // print_vector(v, " ");
+    points.push_back(v);
+
+    alpha += angle;
+    t += dt;
+  }
+  size = pts_cnt;
+}
+
+inline float Chromosome::getDiameter() const {
+  float diameter = 0.0f, d;
+  for (int i = 0; i < size; ++i) {
+    for (int l = i + 1; l < size; ++l) {
+      d = (points[i] - points[l]).lengthSqr();
+      diameter = max(diameter, d);
+    }
+  }
+  return sqrt(diameter);
+}
+
+inline float Chromosome::calcDistance(const Chromosome &chr) {
+  float d1, d2, dist = 0.0f;
+  for (int i = 0; i < size; ++i) {
+    for (int l = i + 1; l < size; ++l) {
+      d1 = (points[i] - points[l]).length();
+      d2 = (chr.points[i] - chr.points[l]).length();
+      // printf("= %f %f %f\n", d1, d2, fabs(d1- d2));
+      dist += fabs(d1 - d2);
+    }
+  }
+  return (dist / ((size * (size - 1) / 2)));
+}
+
+inline float Chromosome::calcRMSD(const Chromosome &chr) {
+
+  std::vector<double> str1_buf(size * 3), str2_buf(size * 3);
+  double (*str1)[3] = reinterpret_cast<double(*)[3]>(str1_buf.data());
+  double (*str2)[3] = reinterpret_cast<double(*)[3]>(str2_buf.data());
+  double res = -1.0;
+
+  for (int i = 0; i < size; ++i) {
+    str1[i][0] = points[i].x;
+    str1[i][1] = points[i].y;
+    str1[i][2] = points[i].z;
+    str2[i][0] = chr.points[i].x;
+    str2[i][1] = chr.points[i].y;
+    str2[i][2] = chr.points[i].z;
+  }
+
+  fast_rmsd(str1, str2, size, &res);
+  // printf("rmsd: %lf\n", res);
+  // fast_rmsd(double ref_xlist[][3], double mov_xlist[][3], int n_list, double*
+  // rmsd);
+  return static_cast<float>(res);
+}
+
+inline vector<vector<float>> Chromosome::calcBaseDensity(float sphere_r) {
+  // we approximate linear structure by additional points added to the structure
+  // beetwen every two beads we add N points
+
+  vector<vector3> pts;
+  int N = 5, pts_cnt;
+  float dist;
+  vector3 curr, diff;
+  vector<int> intersection;
+  bool is_contained = false;
+  vector<vector<float>> out;
+  vector<float> tmp;
+  out.push_back(tmp);
+  out.push_back(tmp);
+  out.push_back(tmp);
+
+  if (sphere_r < 1e-6)
+    sphere_r = this->getDiameter() / 5.0f;
+
+  // create a list of points
+  for (int i = 0; i < size - 1; ++i) {
+    pts.push_back(points[i]);
+    diff = (points[i + 1] - points[i]) / static_cast<float>(N + 1);
+    curr = points[i];
+    for (int j = 0; j < N; ++j) {
+      curr += diff;
+      pts.push_back(curr);
+    }
+  }
+  pts.push_back(points[size - 1]); // add last point
+
+  sphere_r = sphere_r * sphere_r; // for optimization, we calculate distance
+                                  // squared, so we need to square radius too
+  pts_cnt = static_cast<int>(pts.size());
+  for (int i = 0; i < pts_cnt; i++) {
+
+    is_contained = false;
+    if (i % 100 == 0)
+      printf("%d/%d\n", i, size);
+    printf("%f %f %f\n", pts[i].x, pts[i].y, pts[i].z);
+    intersection.clear();
+    for (int j = 0; j < size; ++j) {
+      dist = (pts[i] - pts[j]).lengthSqr();
+      if ((dist <= sphere_r && !is_contained) ||
+          (dist > sphere_r && is_contained)) {
+        is_contained = !is_contained;
+        intersection.push_back(j);
+      }
+    }
+
+    // we need to "close" the intersection, if the end point is contained in the
+    // last sphere
+    if (is_contained)
+      intersection.push_back(size - 1);
+
+    int base_density = 0, base_looping = 0;
+
+    // intersections come in pairs (a[k], b[k]).
+    // for density, we sum b[k]-a[k] for k such that i belong to (a[k], b[k])
+    // for looping, we sum intervals for all other k
+    for (size_t j = 0; j < intersection.size(); j += 2) {
+      if (intersection[j] <= i && intersection[j + 1] >= i)
+        base_density += intersection[j + 1] - intersection[j] + 1;
+      else
+        base_looping += intersection[j + 1] - intersection[j] + 1;
+    }
+
+    // printf("%d %d %d   %d\n", i, base_density, base_looping,
+    // intersection.size());
+    out[0].push_back(static_cast<float>(base_density));
+    out[1].push_back(static_cast<float>(base_looping));
+    out[2].push_back(static_cast<float>(base_density + base_looping));
+  }
+  return out;
+}
+
+inline int Chromosome::getMostDistantPointsPair(float &dist) {
+  float max = 0.0f, curr;
+  int maxi = 0;
+  for (int i = 0; i < size - 1; ++i) {
+    curr = (points[i] - points[i + 1]).lengthSqr();
+    if (curr > max) {
+      max = curr;
+      maxi = i;
+    }
+  }
+  dist = sqrt(max);
+  return maxi;
+}
+
+inline std::vector<float> Chromosome::getConsecutiveBeadDistances() {
+  std::vector<float> v;
+  for (int i = 0; i < size - 1; ++i)
+    v.push_back((points[i] - points[i + 1]).length());
+  return v;
+}
+
+inline float Chromosome::getAvgConsecutiveBeadDistance() {
+  float v = 0.0f;
+  for (int i = 0; i < size - 1; ++i) {
+    v += (points[i] - points[i + 1]).length();
+  }
+  return v / (size - 1);
+}
+
+inline void Chromosome::trim(int start, int end) {
+  if (size >= start) {
+    if (end == 0)
+      points.erase(points.begin() + start, points.end());
+    else
+      points.erase(points.begin() + start, points.begin() + end);
+  }
+}
+
+inline void Chromosome::toFile(string filename) {
+  FILE *f;
+  f = open(filename, "w");
+  if (f == NULL)
+    return;
+
+  if (size > 0) {
+    fprintf(f, "%d\n", size);
+    this->toFile(f);
+  } else {
+    fprintf(f, "0");
+  }
+
+  fclose(f);
+}
+
+inline void Chromosome::toFile(FILE *file) {
+  for (int i = 0; i < size; i++) {
+    if (genomic_position.size() > static_cast<std::size_t>(i))
+      fprintf(file, "%f %f %f %d\n", points[i].x, points[i].y, points[i].z,
+              genomic_position[i]);
+    else
+      fprintf(file, "%f %f %f\n", points[i].x, points[i].y, points[i].z);
+  }
+}
+
+inline void Chromosome::fromFilePDB(string filename) {
+  FILE *f = open(filename, "r");
+  if (f == NULL)
+    return;
+
+  int i;
+  init();
+
+  char line[4096];
+  char word[8];
+
+  while (1) {
+
+    if (fgets(line, 4096, f) == NULL)
+      break;
+
+    if (strncmp(line, "ATOM", 4) != 0)
+      continue;
+    // printf("line = [%s]", line);
+
+    float x, y, z;
+    for (i = 0; i < 5; ++i)
+      word[i] = line[33 + i];
+    x = static_cast<float>(atof(word));
+    for (i = 0; i < 5; ++i)
+      word[i] = line[41 + i];
+    y = static_cast<float>(atof(word));
+    for (i = 0; i < 5; ++i)
+      word[i] = line[49 + i];
+    z = static_cast<float>(atof(word));
+
+    points.push_back(vector3(x, y, z));
+  }
+
+  fclose(f);
+}
+
+inline void Chromosome::fromFile(FILE *file, int pts_cnt) {
+
+  init();
+  if (pts_cnt < 0) {
+    // unknown length
+    double x, y, z;
+    while (!feof(file)) {
+      if (fscanf(file, "%lf %lf %lf", &x, &y, &z) == 3)
+        points.push_back(vector3(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+    }
+    size = static_cast<int>(points.size());
+  } else {
+    if (pts_cnt == 0)
+      fscanf(file, "%d", &pts_cnt);
+
+    float x, y, z;
+    for (int i = 0; i < pts_cnt; i++) {
+      fscanf(file, "%f %f %f", &x, &y, &z);
+      points.push_back(vector3(x, y, z));
+    }
+    size = pts_cnt;
+  }
+}
+
+#endif /* CHROMOSOME_H_ */

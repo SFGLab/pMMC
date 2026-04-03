@@ -17,9 +17,9 @@
 #include <stdio.h>
 #include <vector>
 
-#include <Chromosome.h>
-#include <Cluster.h>
-#include <InteractionArcs.h>
+#include <Chromosome.hpp>
+#include <Cluster.hpp>
+#include <InteractionArcs.hpp>
 #include <optional>
 #ifdef __CUDACC__
 #include <vector_types.h>

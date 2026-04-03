@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B1A2C3D4-0001-0001-0001-000000000001}</ProjectGuid>
+    <RootNamespace>pMMClib</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+    <ProjectName>pMMC-lib</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <!-- Debug x64 -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <!-- Release x64 -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.props" />
+  </ImportGroup>
+  <!-- Common property overrides -->
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)..\build\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)..\build\intermediate\$(Configuration)\pMMC-lib\</IntDir>
+    <TargetName>pMMC-lib</TargetName>
+  </PropertyGroup>
+  <!-- Debug compile settings -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;_CRT_SECURE_NO_WARNINGS;WIN32;_WIN64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\thirdparty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <CudaCompile>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
+      <CodeGeneration>compute_89,sm_89</CodeGeneration>
+      <AdditionalOptions>--std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\thirdparty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <GenerateRelocatableDeviceCode>true</GenerateRelocatableDeviceCode>
+    </CudaCompile>
+  </ItemDefinitionGroup>
+  <!-- Release compile settings -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_WARNINGS;WIN32;_WIN64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\thirdparty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <CudaCompile>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
+      <CodeGeneration>compute_89,sm_89</CodeGeneration>
+      <AdditionalOptions>--std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\thirdparty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <GenerateRelocatableDeviceCode>true</GenerateRelocatableDeviceCode>
+    </CudaCompile>
+  </ItemDefinitionGroup>
+  <!-- C/C++ source files -->
+  <ItemGroup>
+    <ClCompile Include="..\..\thirdparty\common.cpp" />
+    <ClCompile Include="..\..\thirdparty\INIReader.cpp" />
+    <ClCompile Include="..\..\thirdparty\mtxlib.cpp" />
+    <ClCompile Include="..\..\thirdparty\rmsd.cpp" />
+    <ClCompile Include="..\..\thirdparty\getopt.c" />
+    <ClCompile Include="..\..\thirdparty\ini.c" />
+  </ItemGroup>
+  <!-- CUDA source files -->
+  <ItemGroup>
+    <CudaCompile Include="..\..\src\HierarchicalChromosome.cu" />
+    <CudaCompile Include="..\..\src\ParallelMarkArcs.cu" />
+    <CudaCompile Include="..\..\src\ParallelMonteCarloHeatmap.cu" />
+    <CudaCompile Include="..\..\src\ParallelMonteCarloArcs.cu" />
+    <CudaCompile Include="..\..\src\ParallelMonteCarloSmooth.cu" />
+  </ItemGroup>
+  <!-- Header files (for IDE browsing) -->
+  <ItemGroup>
+    <ClInclude Include="..\..\include\AppCommon.hpp" />
+    <ClInclude Include="..\..\include\SaveModelWithFormat.hpp" />
+    <ClInclude Include="..\..\include\Anchor.hpp" />
+    <ClInclude Include="..\..\include\BedRegion.hpp" />
+    <ClInclude Include="..\..\include\BedRegions.hpp" />
+    <ClInclude Include="..\..\include\BenchmarkRunner.hpp" />
+    <ClInclude Include="..\..\include\Chromosome.hpp" />
+    <ClInclude Include="..\..\include\ChromosomesSet.hpp" />
+    <ClInclude Include="..\..\include\CifWriter.hpp" />
+    <ClInclude Include="..\..\include\Cluster.hpp" />
+    <ClInclude Include="..\..\include\ContactMatrixIO.hpp" />
+    <ClInclude Include="..\..\include\Density.hpp" />
+    <ClInclude Include="..\..\include\DistanceMapGenerator.hpp" />
+    <ClInclude Include="..\..\include\FlowchartGenerator.hpp" />
+    <ClInclude Include="..\..\include\GenomeReconstructor.hpp" />
+    <ClInclude Include="..\..\include\Heatmap.hpp" />
+    <ClInclude Include="..\..\include\HeatmapImageWriter.hpp" />
+    <ClInclude Include="..\..\include\HierarchicalChromosome.h" />
+    <ClInclude Include="..\..\include\IbedFileIO.hpp" />
+    <ClInclude Include="..\..\include\InteractionArc.hpp" />
+    <ClInclude Include="..\..\include\InteractionArcs.hpp" />
+    <ClInclude Include="..\..\include\LooperSolver.hpp" />
+    <ClInclude Include="..\..\include\MdsInitializer.hpp" />
+    <ClInclude Include="..\..\include\MergedFileIO.hpp" />
+    <ClInclude Include="..\..\include\MetricsFramework.hpp" />
+    <ClInclude Include="..\..\include\MultiscaleEnergy.hpp" />
+    <ClInclude Include="..\..\include\PdbWriter.hpp" />
+    <ClInclude Include="..\..\include\PicturePanel.hpp" />
+    <ClInclude Include="..\..\include\platform.h" />
+    <ClInclude Include="..\..\include\Settings.hpp" />
+    <ClInclude Include="..\..\include\SimulationLogger.hpp" />
+    <ClInclude Include="..\..\include\SphericalContainer.hpp" />
+    <ClInclude Include="..\..\include\Static.hpp" />
+    <ClInclude Include="..\..\include\SvgChartGenerator.hpp" />
+    <ClInclude Include="..\..\include\SyntheticGenerator.hpp" />
+    <ClInclude Include="..\..\include\VisualizationScripts.hpp" />
+    <ClInclude Include="..\..\thirdparty\common.h" />
+    <ClInclude Include="..\..\thirdparty\getopt.h" />
+    <ClInclude Include="..\..\thirdparty\ini.h" />
+    <ClInclude Include="..\..\thirdparty\INIReader.h" />
+    <ClInclude Include="..\..\thirdparty\mtxlib.h" />
+    <ClInclude Include="..\..\thirdparty\rmsd.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.targets" />
+  </ImportGroup>
+</Project>

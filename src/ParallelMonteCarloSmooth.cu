@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <vector>
 
-#include <LooperSolver.h>
+#include <LooperSolver.hpp>
 
 /* -------------------------------------------------------------------------
  * Error-checking macro
@@ -44,6 +44,7 @@ inline void gpuAssertSmooth(cudaError_t code, const char *file, int line,
  * Device-side iteration counter
  * ---------------------------------------------------------------------- */
 __device__ int d_smooth_total_iterations;
+__device__ int d_smooth_total_accepted;
 
 /* -------------------------------------------------------------------------
  * POD struct for all MC settings passed to the kernel
@@ -62,7 +63,20 @@ struct smooth_gpu_settings {
   float weightDistSmooth;
   float weightAngleSmooth;
   bool  use2D;
+  float3 sphere_center;
+  float sphere_radius;
 };
+
+__device__ __forceinline__ float sphereBoundaryPenalty(float3 pos, float3 center, float radius) {
+    if (radius <= 0.0f) return 0.0f;
+    float dx = pos.x - center.x;
+    float dy = pos.y - center.y;
+    float dz = pos.z - center.z;
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (dist <= radius) return 0.0f;
+    float overshoot = dist - radius;
+    return overshoot * overshoot;
+}
 
 /* =========================================================================
  * Device helper: compute the local smooth energy for bead p.
@@ -133,6 +147,9 @@ __device__ float calcLocalEnergySmooth(
     }
   }
 
+  /* Sphere boundary penalty for the moved bead. */
+  sca += sphereBoundaryPenalty(pos_p, s.sphere_center, s.sphere_radius);
+
   return sca + scb;
 }
 
@@ -181,7 +198,14 @@ __device__ float calcFullEnergySmooth(
     }
   }
 
-  return sca * s.weightDistSmooth + scb * s.weightAngleSmooth;
+  /* Sphere boundary penalty for all beads. */
+  float sphere_penalty = 0.0f;
+  for (int i = 0; i < active_n; ++i) {
+    sphere_penalty += sphereBoundaryPenalty(positions[i], s.sphere_center,
+                                            s.sphere_radius);
+  }
+
+  return sca * s.weightDistSmooth + scb * s.weightAngleSmooth + sphere_penalty;
 }
 
 /* =========================================================================
@@ -232,6 +256,7 @@ __global__ void MonteCarloSmoothKernelMultiWarp(
   float score_prev   = calcFullEnergySmooth(my_pos, dist_to_next, active_n, s);
   float step         = step_size;
   int   iterations   = 0;
+  int   total_accepted = 0;
   int   milestone_successes = 0;
   int   improvement_misses  = 0;
   float milestone_score     = score_prev;
@@ -282,6 +307,7 @@ __global__ void MonteCarloSmoothKernelMultiWarp(
         my_pos[chosen_p] = new_pos;
         score_prev = new_total;
         ++milestone_successes;
+        ++total_accepted;
         if (score_prev < best_score) best_score = score_prev;
       }
 
@@ -314,8 +340,10 @@ __global__ void MonteCarloSmoothKernelMultiWarp(
   d_best_score[warpId] = best_score;
 
   /* Record iteration count from warp 0 */
-  if (warpId == 0)
+  if (warpId == 0) {
     d_smooth_total_iterations = iterations;
+    d_smooth_total_accepted = total_accepted;
+  }
 
   state[tid] = localState;
 }
@@ -340,7 +368,9 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
   }
 
   const int threads_per_block = 32; /* 1 warp per block */
-  int blocks = gpu_cache.sm_count;  /* 1 block per SM → sm_count warps */
+  /* Use the memory-capped warp count from initSmoothBuffers if available,
+   * otherwise fall back to sm_count. This prevents OOM on large chromosomes. */
+  int blocks = (gpu_cache.smooth_n_warps > 0) ? gpu_cache.smooth_n_warps : gpu_cache.sm_count;
   if (blocks < 1) blocks = 1;
   int n_warps = blocks; /* 1 warp per block */
 
@@ -415,6 +445,8 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
   s.weightDistSmooth                 = Settings::weightDistSmooth;
   s.weightAngleSmooth                = Settings::weightAngleSmooth;
   s.use2D                            = Settings::use2D;
+  s.sphere_center                    = make_float3(0.0f, 0.0f, 0.0f);
+  s.sphere_radius                    = Settings::sphere_radius;
 
   float T_init = static_cast<float>(Settings::maxTempSmooth);
 
@@ -458,10 +490,14 @@ float LooperSolver::ParallelMonteCarloSmooth(float step_size,
     }
   }
 
-  /* Retrieve iteration count */
-  int gpu_iters = 0;
+  /* Retrieve iteration and acceptance counts */
+  int gpu_iters = 0, gpu_accepted = 0;
   cudaMemcpyFromSymbol(&gpu_iters, d_smooth_total_iterations, sizeof(int));
+  cudaMemcpyFromSymbol(&gpu_accepted, d_smooth_total_accepted, sizeof(int));
   total_mc_steps += gpu_iters;
+
+  if (sim_logger)
+    sim_logger->logAcceptanceRatio("smooth_gpu", gpu_iters, gpu_accepted);
 
   /* Compute final CPU-side energy (authoritative) */
   double final_score = calcScoreStructureSmooth(true, true);

@@ -52,7 +52,7 @@
 #include <stdio.h>
 #include <time.h>
 
-#include <LooperSolver.h>
+#include <LooperSolver.hpp>
 
 /* ======================================================================
  * Error-check macro (mirrors ParallelMonteCarloHeatmap.cu)
@@ -154,8 +154,26 @@ void GpuResourceCache::initSmoothBuffers(int max_n) {
   cudaMalloc(&d_smooth_fixed, (size_t)max_n * sizeof(bool));
   cudaMalloc(&d_smooth_dist, (size_t)max_n * sizeof(float));
 
-  /* Reallocate per-warp buffers for multi-warp smooth kernel */
+  /* Reallocate per-warp buffers for multi-warp smooth kernel.
+   * Cap n_warps based on available GPU memory to prevent OOM on
+   * large chromosomes. Each warp needs max_n * sizeof(float3) bytes. */
   int n_warps = sm_count > 0 ? sm_count : 46;
+
+  // Query free memory and cap warps to fit
+  size_t gpu_free = 0, gpu_total = 0;
+  if (cudaMemGetInfo(&gpu_free, &gpu_total) == cudaSuccess) {
+    size_t per_warp = (size_t)max_n * sizeof(float3);
+    // Reserve 256MB headroom for other allocations
+    size_t available = (gpu_free > 256 * 1024 * 1024) ? gpu_free - 256 * 1024 * 1024 : gpu_free / 2;
+    int max_warps = (per_warp > 0) ? (int)(available / per_warp) : n_warps;
+    if (max_warps < 1) max_warps = 1;
+    if (n_warps > max_warps) {
+      printf("[GPU] Capping smooth warps from %d to %d (%.0f MB free, %.1f MB per warp)\n",
+             n_warps, max_warps, gpu_free / 1e6, per_warp / 1e6);
+      n_warps = max_warps;
+    }
+  }
+
   if (max_n > smooth_warp_max_n || n_warps > smooth_n_warps) {
     if (d_smooth_warp_positions) cudaFree(d_smooth_warp_positions);
     if (d_smooth_warp_scores)    cudaFree(d_smooth_warp_scores);
@@ -214,7 +232,20 @@ struct ArcsMCSettings {
   float springConstantSqueezeArcs;
   bool  use2D;
   int   milestoneFailsThreshold; /**< Max consecutive milestone failures before stopping. */
+  float3 sphere_center;
+  float sphere_radius;
 };
+
+__device__ __forceinline__ float sphereBoundaryPenalty(float3 pos, float3 center, float radius) {
+    if (radius <= 0.0f) return 0.0f;
+    float dx = pos.x - center.x;
+    float dy = pos.y - center.y;
+    float dz = pos.z - center.z;
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (dist <= radius) return 0.0f;
+    float overshoot = dist - radius;
+    return overshoot * overshoot;
+}
 
 /* ======================================================================
  * Device-side RNG helpers
@@ -360,6 +391,7 @@ __global__ void arcs_setupKernel(curandState *state, unsigned int seed) {
  * Device variable: total iteration count (for logging, like heatmap kernel).
  * ====================================================================== */
 __device__ int d_arcs_total_iterations;
+__device__ int d_arcs_total_accepted;
 
 /* ======================================================================
  * Main SA kernel.
@@ -428,6 +460,7 @@ __global__ void MonteCarloArcsKernel(
   float score_curr = 0.0f;
   float score_prev = 0.0f;
   int   iterations = 0;
+  int   total_accepted = 0;
   int   imp_misses = 0;
   int   milestone_successes = 0;
   float milestone_score = 0.0f;
@@ -469,6 +502,11 @@ __global__ void MonteCarloArcsKernel(
       float dist = sqrtf(dx*dx + dy*dy + dz*dz);
       float delta = dist - loop_params[k].y;
       my_sc += loop_params[k].x * delta * delta;
+    }
+    /* Sphere boundary penalty for all beads. */
+    for (int i = lane; i < n; i += 32) {
+      my_sc += sphereBoundaryPenalty(my_pos[i], settings.sphere_center,
+                                     settings.sphere_radius);
     }
     my_sc = warp_reduce_sum(my_sc);
     score_curr = __shfl_sync(FULL_WARP_MASK, my_sc, 0);
@@ -516,6 +554,10 @@ __global__ void MonteCarloArcsKernel(
                                       lane);
         my_sc += arcs_loop_score_bead(bead_idx, my_pos,
                                       loop_pairs, loop_params, n_loops, lane);
+        /* Sphere penalty for moved bead (lane 0 only to avoid double-counting). */
+        if (lane == 0)
+          my_sc += sphereBoundaryPenalty(my_pos[bead_idx], settings.sphere_center,
+                                         settings.sphere_radius);
         my_sc = warp_reduce_sum(my_sc);
         sc_before = __shfl_sync(FULL_WARP_MASK, my_sc, 0);
       }
@@ -538,6 +580,10 @@ __global__ void MonteCarloArcsKernel(
                                       lane);
         my_sc += arcs_loop_score_bead(bead_idx, my_pos,
                                       loop_pairs, loop_params, n_loops, lane);
+        /* Sphere penalty for moved bead (lane 0 only to avoid double-counting). */
+        if (lane == 0)
+          my_sc += sphereBoundaryPenalty(my_pos[bead_idx], settings.sphere_center,
+                                         settings.sphere_radius);
         my_sc = warp_reduce_sum(my_sc);
         sc_after = __shfl_sync(FULL_WARP_MASK, my_sc, 0);
       }
@@ -561,8 +607,10 @@ __global__ void MonteCarloArcsKernel(
 
       if (accept) {
         score_curr = new_total;
-        if (lane == 0)
+        if (lane == 0) {
           milestone_successes++;
+          total_accepted++;
+        }
       } else {
         /* Revert move. */
         if (lane == 0) {
@@ -615,6 +663,7 @@ __global__ void MonteCarloArcsKernel(
   if (lane == 0) {
     d_best_score[warp_id] = score_curr;
     d_arcs_total_iterations = iterations;
+    d_arcs_total_accepted = total_accepted;
   }
   /* All lanes cooperate to copy local positions to output. */
   for (int i = lane; i < n; i += 32) {
@@ -723,6 +772,8 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
   gpu_settings.use2D                      = Settings::use2D;
   /* Reuse milestoneFailsThreshold from heatmap settings as convergence guard. */
   gpu_settings.milestoneFailsThreshold    = Settings::milestoneFailsThreshold;
+  gpu_settings.sphere_center              = make_float3(0.0f, 0.0f, 0.0f);
+  gpu_settings.sphere_radius              = Settings::sphere_radius;
 
   /* ------------------------------------------------------------------
    * Ensure pre-allocated device buffers are large enough.
@@ -813,8 +864,8 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
   /* Seed RNG only once (first call), then reuse. Each call continues
    * the RNG sequence from where the previous call left off. */
   if (!gpu_cache.arcs_states_seeded) {
-    unsigned int seed = (s_arcs_gpu_seed != 0)
-                            ? s_arcs_gpu_seed
+    unsigned int seed = (Settings::gpuSeed != 0)
+                            ? Settings::gpuSeed
                             : static_cast<unsigned int>(time(NULL));
     arcs_setupKernel<<<blocks, threads_per_block>>>(d_states, seed);
     gpuErrchkArcs(cudaDeviceSynchronize());
@@ -875,9 +926,13 @@ float LooperSolver::parallelMonteCarloArcs(float step_size) {
   /* ------------------------------------------------------------------
    * Retrieve GPU iteration count for logging.
    * ------------------------------------------------------------------ */
-  int gpu_iters = 0;
+  int gpu_iters = 0, gpu_accepted = 0;
   cudaMemcpyFromSymbol(&gpu_iters, d_arcs_total_iterations, sizeof(int));
+  cudaMemcpyFromSymbol(&gpu_accepted, d_arcs_total_accepted, sizeof(int));
   total_mc_steps += gpu_iters;
+
+  if (sim_logger)
+    sim_logger->logAcceptanceRatio("arcs_gpu", gpu_iters, gpu_accepted);
 
   /* Use GPU-computed best score directly to avoid O(n²) CPU recomputation.
    * The score is only used for best-structure selection (steps is typically 1). */

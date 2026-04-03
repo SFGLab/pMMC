@@ -6,6 +6,44 @@
 trajectory.txt
 energy.txt
 merge.txt
+test/
+docs/
+
+# Test output directories
+*test*/
+*output*/
+*OUTPUT*/
+build*/
+loops_*/
+
+# Benchmark results
+benchmark*/
+benchmark_results.*
+run_benchmark.sh
+run_ensemble_benchmark.sh
+run_quality_comparison.sh
+run_resource_monitor.sh
+run_scalability.sh
+run_speed_benchmark.sh
+
+# Test datasets
+datasets/
+
+# Verification/test docs
+pmmc_verification_prompt*.md
+
+# Build scripts (temporary)
+build.bat
+build2.bat
+build_log.txt
+
+# Claude / AI-related files (do not commit)
+.claude/
+CLAUDE.md
+context_checklist.txt
+context*
+requirements_list.md
+iteration_log.txt
 
 # User-specific files
 *.exe

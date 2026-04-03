@@ -1,38 +1,21 @@
 cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
-project(3dgnome LANGUAGES C CXX CUDA)
+project(pMMC LANGUAGES C CXX CUDA)
 
-set(SOURCES
-  src/main.cpp
-  src/Anchor.cpp
-  src/chromosomesset.cpp
+# ── CUDA architecture ───────────────────────────────────────────────
+if(NOT CUDA_ARCH)
+  message(SEND_ERROR "YOU NEED TO SPECIFY CUDA ARCHITECTURE E.G. -DCUDA_ARCH=\"89\"")
+endif()
+
+# ── pMMC-lib  (static library: CUDA kernels + thirdparty) ──────────
+set(LIB_CUDA_SOURCES
   src/HierarchicalChromosome.cu
-  src/LooperSolver.cpp
-  src/BedRegion.cpp
-  src/cluster.cpp
-  src/InteractionArc.cpp
   src/ParallelMarkArcs.cu
-  src/BedRegions.cpp
-  src/density.cpp
-  src/InteractionArcs.cpp
   src/ParallelMonteCarloHeatmap.cu
   src/ParallelMonteCarloArcs.cu
   src/ParallelMonteCarloSmooth.cu
-  src/chromosome.cpp
-  src/heatmap.cpp
-  src/Settings.cpp
-  src/SyntheticGenerator.cpp
-  src/BenchmarkRunner.cpp
-  src/MultiscaleEnergy.cpp
-  src/SimulationLogger.cpp
-  src/DistanceMapGenerator.cpp
-  src/MetricsFramework.cpp
-  src/CifWriter.cpp
-  src/PdbWriter.cpp
-  src/MdsInitializer.cpp
-  src/GenomeReconstructor.cpp
-  src/MergedFileIO.cpp
-  src/IbedFileIO.cpp
-  src/HeatmapImageWriter.cpp
+)
+
+set(LIB_CPP_SOURCES
   thirdparty/common.cpp
   thirdparty/ini.c
   thirdparty/INIReader.cpp
@@ -40,81 +23,74 @@ set(SOURCES
   thirdparty/rmsd.cpp
 )
 
-# Add portable getopt on Windows
 if(WIN32)
-  list(APPEND SOURCES thirdparty/getopt.c)
+  list(APPEND LIB_CPP_SOURCES thirdparty/getopt.c)
 endif()
 
-set(HEADERS
-  include/Anchor.h
-  include/Chromosome.h
-  include/Density.h
-  include/InteractionArc.h
-  include/Settings.h
-  include/BedRegion.h
-  include/ChromosomesSet.h
-  include/Heatmap.h
-  include/InteractionArcs.h
-  include/BedRegions.h
-  include/Cluster.h
-  include/HierarchicalChromosome.h
-  include/LooperSolver.h
-  include/SyntheticGenerator.h
-  include/BenchmarkRunner.h
-  include/MultiscaleEnergy.h
-  include/SimulationLogger.h
-  include/DistanceMapGenerator.h
-  include/MetricsFramework.h
-  include/platform.h
-  include/CifWriter.h
-  include/PdbWriter.h
-  include/MdsInitializer.h
-  include/GenomeReconstructor.h
-  include/MergedFileIO.h
-  include/IbedFileIO.h
-  include/HeatmapImageWriter.h
-  thirdparty/common.h
-  thirdparty/ini.h
-  thirdparty/INIReader.h
-  thirdparty/mtxlib.h
-  thirdparty/rmsd.h
+add_library(pMMC-lib STATIC ${LIB_CUDA_SOURCES} ${LIB_CPP_SOURCES})
+
+target_include_directories(pMMC-lib PUBLIC
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/thirdparty
 )
 
-add_executable(pMMC)
+target_compile_features(pMMC-lib PUBLIC cxx_std_17)
 
-# Platform-specific compiler options
 if(MSVC)
-  target_compile_options(pMMC PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:C>:/W3>)
-  target_compile_definitions(pMMC PUBLIC _CRT_SECURE_NO_WARNINGS)
+  target_compile_options(pMMC-lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:C>:/W3>)
+  target_compile_definitions(pMMC-lib PUBLIC _CRT_SECURE_NO_WARNINGS WIN32 _WIN64)
 else()
-  target_compile_options(pMMC PUBLIC -Wall)
+  target_compile_options(pMMC-lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-Wall> $<$<COMPILE_LANGUAGE:C>:-Wall>)
 endif()
 
-target_compile_features(pMMC PUBLIC cxx_std_17)
-set_target_properties(pMMC PROPERTIES CXX_STANDARD 17)
-set_target_properties(pMMC PROPERTIES CMAKE_CUDA_STANDARD 11)
-set_target_properties(pMMC PROPERTIES CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-if(NOT CUDA_ARCH)
-  message(SEND_ERROR "YOU NEED TO SPECIFY CUDA ARCHITECTURE E.G. -DCUDA_ARCH=\"80\"")
-endif()
-
-set_target_properties(pMMC PROPERTIES CUDA_ARCHITECTURES "${CUDA_ARCH}")
-
-set_target_properties(pMMC PROPERTIES CUDA_RUNTIME_LIBRARY static)
-
-target_include_directories(pMMC PUBLIC
-  ${CMAKE_SOURCE_DIR}/thirdparty/
-  ${CMAKE_SOURCE_DIR}/include/
+set_target_properties(pMMC-lib PROPERTIES
+  CUDA_ARCHITECTURES "${CUDA_ARCH}"
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  CUDA_RUNTIME_LIBRARY Static
 )
 
-target_sources(pMMC PUBLIC ${SOURCES} ${HEADERS})
-
-set_target_properties(pMMC PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-set_property(TARGET pMMC PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-
-# Link psapi on Windows for GetProcessMemoryInfo (memory instrumentation)
-if(WIN32)
-  target_link_libraries(pMMC PUBLIC psapi)
+# OpenMP for CPU-side parallel execution (CXX only, not CUDA)
+include(CheckCXXCompilerFlag)
+if(MSVC)
+  check_cxx_compiler_flag(/openmp HAS_OPENMP)
+  if(HAS_OPENMP)
+    target_compile_options(pMMC-lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/openmp>)
+    message(STATUS "OpenMP found — CPU multi-threading enabled")
+  else()
+    message(STATUS "OpenMP not found — CPU multi-threading disabled")
+  endif()
+else()
+  find_package(OpenMP COMPONENTS CXX)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(pMMC-lib PUBLIC OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP found — CPU multi-threading enabled")
+  else()
+    message(STATUS "OpenMP not found — CPU multi-threading disabled")
+  endif()
 endif()
+
+# ── Helper: add an executable that links pMMC-lib ──────────────────
+function(add_pmmc_exe TARGET_NAME SOURCE_FILE)
+  add_executable(${TARGET_NAME} ${SOURCE_FILE})
+  target_link_libraries(${TARGET_NAME} PRIVATE pMMC-lib)
+  if(WIN32)
+    target_link_libraries(${TARGET_NAME} PRIVATE psapi)
+  endif()
+  if(MSVC)
+    set_target_properties(${TARGET_NAME} PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")
+  endif()
+  set_target_properties(${TARGET_NAME} PROPERTIES
+    CUDA_ARCHITECTURES "${CUDA_ARCH}"
+    CUDA_RUNTIME_LIBRARY Static
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  )
+endfunction()
+
+# ── Executables ────────────────────────────────────────────────────
+add_pmmc_exe(pMMC-reconstruct  MSVC++/pMMC-reconstruct/main_reconstruct.cpp)
+add_pmmc_exe(pMMC-analyze      MSVC++/pMMC-analyze/main_analyze.cpp)
+add_pmmc_exe(pMMC-convert      MSVC++/pMMC-convert/main_convert.cpp)
+add_pmmc_exe(pMMC-generate     MSVC++/pMMC-generate/main_generate.cpp)
+add_pmmc_exe(pMMC-benchmark    MSVC++/pMMC-benchmark/main_benchmark.cpp)
+add_pmmc_exe(pMMC-flowchart    MSVC++/pMMC-flowchart/main_flowchart.cpp)
