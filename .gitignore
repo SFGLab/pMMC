@@ -36,6 +36,7 @@ pmmc_verification_prompt*.md
 build.bat
 build2.bat
 build_log.txt
+build_wsl.sh
 
 # Claude / AI-related files (do not commit)
 .claude/
