@@ -16,22 +16,22 @@ set(LIB_CUDA_SOURCES
 )
 
 set(LIB_CPP_SOURCES
-  thirdparty/common.cpp
-  thirdparty/ini.c
-  thirdparty/INIReader.cpp
-  thirdparty/mtxlib.cpp
-  thirdparty/rmsd.cpp
+  src/thirdparty/common.cpp
+  src/thirdparty/ini.c
+  src/thirdparty/INIReader.cpp
+  src/thirdparty/mtxlib.cpp
+  src/thirdparty/rmsd.cpp
 )
 
 if(WIN32)
-  list(APPEND LIB_CPP_SOURCES thirdparty/getopt.c)
+  list(APPEND LIB_CPP_SOURCES src/thirdparty/getopt.c)
 endif()
 
 add_library(pMMC-lib STATIC ${LIB_CUDA_SOURCES} ${LIB_CPP_SOURCES})
 
 target_include_directories(pMMC-lib PUBLIC
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/thirdparty
+  ${CMAKE_SOURCE_DIR}/src/include
+  ${CMAKE_SOURCE_DIR}/src/thirdparty
 )
 
 target_compile_features(pMMC-lib PUBLIC cxx_std_17)
@@ -88,9 +88,9 @@ function(add_pmmc_exe TARGET_NAME SOURCE_FILE)
 endfunction()
 
 # ── Executables ────────────────────────────────────────────────────
-add_pmmc_exe(pMMC-reconstruct  MSVC++/pMMC-reconstruct/main_reconstruct.cpp)
-add_pmmc_exe(pMMC-analyze      MSVC++/pMMC-analyze/main_analyze.cpp)
-add_pmmc_exe(pMMC-convert      MSVC++/pMMC-convert/main_convert.cpp)
-add_pmmc_exe(pMMC-generate     MSVC++/pMMC-generate/main_generate.cpp)
-add_pmmc_exe(pMMC-benchmark    MSVC++/pMMC-benchmark/main_benchmark.cpp)
-add_pmmc_exe(pMMC-flowchart    MSVC++/pMMC-flowchart/main_flowchart.cpp)
+add_pmmc_exe(pMMC-reconstruct  src/apps/pMMC-reconstruct/main_reconstruct.cpp)
+add_pmmc_exe(pMMC-analyze      src/apps/pMMC-analyze/main_analyze.cpp)
+add_pmmc_exe(pMMC-convert      src/apps/pMMC-convert/main_convert.cpp)
+add_pmmc_exe(pMMC-generate     src/apps/pMMC-generate/main_generate.cpp)
+add_pmmc_exe(pMMC-benchmark    src/apps/pMMC-benchmark/main_benchmark.cpp)
+add_pmmc_exe(pMMC-flowchart    src/apps/pMMC-flowchart/main_flowchart.cpp)

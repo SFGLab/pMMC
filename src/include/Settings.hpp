@@ -172,6 +172,10 @@ public:
   /** @name Subanchor-Level Heatmap */
   ///@{
   static bool useSubanchorHeatmap;              /**< Use singleton heatmap at subanchor level. */
+  static bool useGlobalAnchorRefinement;        /**< Run a global anchor-level MC pass after per-IB MC. */
+  static float noiseAnchorSmall;                /**< Per-iter noise for anchor-level MC (default 0.05). */
+  static int stressRefineIterations;            /**< GD iterations for stress refinement after global MC (0=off). */
+  static float stressRefineLR;                  /**< Learning rate for stress refinement. */
   static float subanchorHeatmapInfluence;       /**< Influence weight for subanchor heatmap. */
   static float subanchorHeatmapDistWeight;      /**< Distance weight for subanchor heatmap. */
   static int subanchorEstimateDistancesReplicates;  /**< Replicates for distance estimation at subanchor level. */
@@ -399,6 +403,10 @@ inline void Settings::init() {
   motifOrientationWeigth = 1.0f;
 
   useSubanchorHeatmap = false;
+  useGlobalAnchorRefinement = false;
+  noiseAnchorSmall = 0.05f;
+  stressRefineIterations = 0;
+  stressRefineLR = 0.05f;
   subanchorEstimateDistancesReplicates = 5;
   subanchorEstimateDistancesSteps = 2;
   subanchorHeatmapInfluence = 0.5f;
@@ -693,6 +701,14 @@ inline bool Settings::loadFromINI(std::string ini_path) {
 
   useSubanchorHeatmap = reader.GetBoolean(
       "subanchor_heatmap", "use_subanchor_heatmap", useSubanchorHeatmap);
+  useGlobalAnchorRefinement = reader.GetBoolean(
+      "main", "global_anchor_refinement", useGlobalAnchorRefinement);
+  noiseAnchorSmall = (float)reader.GetReal(
+      "main", "noise_anchor_small", noiseAnchorSmall);
+  stressRefineIterations = reader.GetInteger(
+      "main", "stress_refine_iterations", stressRefineIterations);
+  stressRefineLR = (float)reader.GetReal(
+      "main", "stress_refine_lr", stressRefineLR);
   subanchorEstimateDistancesReplicates =
       reader.GetInteger("subanchor_heatmap", "estimate_distances_replicates",
                         subanchorEstimateDistancesReplicates);

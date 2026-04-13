@@ -19,7 +19,9 @@
 #ifndef LOOPERSOLVER_H_
 #define LOOPERSOLVER_H_
 
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <queue>
 #include <stdarg.h>
 #include <string>
@@ -387,6 +389,23 @@ public:
    * @return Vector of split point indices.
    */
   std::vector<int> findSplit(std::vector<int> gaps, int size, string chr);
+
+  /**
+   * @brief Gradient-descent refinement of anchor positions against the full
+   *        Hi-C pair distance target matrix (short arcs + long_arcs).
+   *
+   * Minimises Σ_{ij in active_region, h_ij>0} w_ij * ((d_ij - t_ij)/t_ij)^2
+   * where t_ij = freqToDistance(h_ij). Called at the end of
+   * reconstructClustersArcsDistances, after the MC global refinement pass,
+   * to close the Pearson-vs-Hi-C gap that per-pair MC can't reach because
+   * its step / noise schedule is tuned for biological springs, not MDS fit.
+   * Operates in place on clusters[active_region[i]].pos.
+   *
+   * @param chr    Chromosome label (used to look up arcs / long_arcs).
+   * @param max_iter  Maximum gradient-descent iterations.
+   * @param lr        Step size.
+   */
+  void stressRefineAnchors(const std::string& chr, int max_iter, float lr);
 
   /**
    * @brief Set debugging limits for faster test runs.
@@ -2133,6 +2152,28 @@ inline std::vector<int> LooperSolver::findGaps(string chr) {
   }
 
   vector_insert_unique(gaps, static_cast<int>(clusters.size()) - 1);
+
+  // For dense Hi-C data, arc coverage never drops to zero between anchors,
+  // so natural gaps are too sparse to realise the predefined segment split.
+  // Inject synthetic gaps at anchors that sit on a predefined segment boundary
+  // so findSplit() has something to line up with.
+  if (segments_predefined.regions.size() > 0) {
+    for (size_t s = 0; s < segments_predefined.regions.size(); ++s) {
+      const auto& reg = segments_predefined.regions[s];
+      if (reg.chr != chr) continue;
+      for (size_t i = start; i < clusters.size(); ++i) {
+        // The "boundary anchor" is the last anchor whose end does not
+        // exceed the segment end — after it comes the next segment.
+        if (clusters[i].end >= reg.end) {
+          vector_insert_unique(gaps, static_cast<int>(i));
+          break;
+        }
+      }
+    }
+    std::sort(gaps.begin(), gaps.end());
+    gaps.erase(std::unique(gaps.begin(), gaps.end()), gaps.end());
+  }
+
   // saveToCSV(ftext("%sloops_length_%s.csv", output_dir.c_str(),
   // label.c_str()), length);
   return gaps;
@@ -2148,59 +2189,49 @@ inline std::vector<int> LooperSolver::findSplit(std::vector<int> gaps, int exp_s
     error(ftext("find split: size mismatch, gaps=%d, clusters=%d", gaps.size(),
                 clusters.size()));
 
-  // if we do have predefined segment split use it
-  // just iterate over all gaps, find the gap span and then check if there is a
-  // split defined in this region we only consider the start coordinate of bed
-  // region
+  // If predefined segments exist, assign each segment boundary to its
+  // closest gap (by genomic position). For dense Hi-C data the gap positions
+  // won't line up exactly with the bed boundaries, so picking the closest
+  // gap is the robust way to honour the user-provided split.
   if (segments_predefined.regions.size() > 0) {
     vector<int> splits;
     splits.push_back(gaps[0]);
 
-    // index of next predefined segment (refers to segments_predefined)
-    // we need to move the index to the correct position (important when there
-    // are multiple chromosomes)
-    int curr_ind = -1;
+    int first_seg_index = -1;
     int last_seg_index = static_cast<int>(segments_predefined.regions.size()) - 1;
     for (size_t i = 0; i < segments_predefined.regions.size(); ++i) {
       if (segments_predefined.regions[i].chr == chr) {
-        if (curr_ind == -1)
-          curr_ind = static_cast<int>(i);
-      } else if (curr_ind != -1) {
+        if (first_seg_index == -1)
+          first_seg_index = static_cast<int>(i);
+      } else if (first_seg_index != -1) {
         last_seg_index = static_cast<int>(i) - 1;
         break;
       }
     }
-
-    // printf("curr ind = %d\n", curr_ind);
-    if (curr_ind == -1)
+    if (first_seg_index == -1)
       error(ftext("no segment split found for %s", chr.c_str()));
 
-    for (size_t i = 1; i + 1 < gaps.size(); ++i) {
+    // For each segment boundary (the end of segment k == start of segment k+1)
+    // find the nearest internal gap and mark it as a split point.
+    for (int s = first_seg_index; s < last_seg_index; ++s) {
+      int boundary = segments_predefined.regions[s].end;
 
-      int gap_start = clusters[gaps[i]].end;
-      int gap_end = clusters[gaps[i] + 1].start;
-      int seg_break = curr_ind <= last_seg_index
-                          ? segments_predefined.regions[curr_ind].start
-                          : -1;
-
-      // printf("gap: %d %d   %d\n", gap_start, gap_end, seg_break);
-
-      // MOD
-      // if (seg_break>=0 && seg_break < gap_start) error("seg break > gap
-      // start"); if (seg_break>=0 && seg_break < gap_start) seg_break++;
-      while (seg_break >= 0 && seg_break < gap_start) {
-        curr_ind++;
-        seg_break = curr_ind <= last_seg_index
-                        ? segments_predefined.regions[curr_ind].start
-                        : -1;
+      int best_gap = -1;
+      int best_dist = std::numeric_limits<int>::max();
+      for (size_t i = 1; i + 1 < gaps.size(); ++i) {
+        int gap_pos = clusters[gaps[i]].end;
+        int d = std::abs(gap_pos - boundary);
+        if (d < best_dist) {
+          best_dist = d;
+          best_gap = static_cast<int>(i);
+        }
       }
-
-      if (seg_break >= gap_start && seg_break <= gap_end) {
-        curr_ind++;
-        splits.push_back(gaps[i]);
+      if (best_gap >= 0) {
+        vector_insert_unique(splits, gaps[best_gap]);
       }
     }
 
+    std::sort(splits.begin(), splits.end());
     vector_insert_unique(splits, gaps[gaps.size() - 1]);
     return splits;
   }
@@ -3918,6 +3949,17 @@ inline float LooperSolver::distToFreqHeatmap(float freq) {
 inline float LooperSolver::freqToDistance(int freq, bool memo) {
   if (memo && freq >= 1 && freq <= 100)
     return freq_to_distance[freq];
+  // For dense Hi-C contact data use a power-law distance mapping
+  // (distance = scale * freq^power + base), which gives a much wider
+  // dynamic range than the exp decay — matching FLAMINGO/LorDG style.
+  // Activated when countToDistA is set to a negative sentinel (power).
+  if (Settings::countToDistA < 0.0) {
+    int fi = freq + Settings::countToDistShift;
+    if (fi < 1) fi = 1;
+    double f = static_cast<double>(fi);
+    return static_cast<float>(Settings::countToDistBaseLevel +
+           Settings::countToDistScale * pow(f, Settings::countToDistA));
+  }
   return static_cast<float>(Settings::countToDistBaseLevel +
          Settings::countToDistScale /
              exp(Settings::countToDistA *
@@ -4094,6 +4136,111 @@ inline void LooperSolver::reconstructClustersArcsDistances() {
       // exit(0);
       // getSnapshot(ftext("cluster_%d,_smoothed", i));
     }
+
+    // ----------------------------------------------------------------------
+    // Global anchor refinement: after per-IB MC, run one more anchor-level
+    // MC pass with ALL anchors of the chromosome in active_region. The
+    // expected-distance matrix now also pulls targets from long_arcs
+    // (cross-IB Hi-C contacts), so this pass directly optimises
+    // inter-segment pair distances and sharpens the structure vs. Hi-C
+    // Pearson correlation.
+    // ----------------------------------------------------------------------
+    if (Settings::useGlobalAnchorRefinement) {
+      printf(" [global anchor refinement] chr %s\n", chr.c_str());
+      // Use ONLY the 360 anchor-level cluster indices. Sub-anchors generated
+      // by densifyActiveRegion live in clusters[] after anchors but we don't
+      // want them in this MC — they have no expected-distance targets and
+      // only add noise. chr_first_cluster[chr] is the global cluster index
+      // of anchor 0 for this chromosome; the next anchors_cnt entries are
+      // the anchors for that chromosome.
+      active_region.clear();
+      const int cstart = chr_first_cluster[chr];
+      const int n_anc = arcs.anchors_cnt[chr];
+      for (int i = 0; i < n_anc; ++i)
+        active_region.push_back(cstart + i);
+
+      if (active_region.size() > 1) {
+        calcAnchorExpectedDistancesHeatmap();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        reconstructClusterArcsDistances(chr_root[chr], 0, false, false);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        total_arcs_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Stress minimisation — direct gradient descent on the full
+        // pair-distance target matrix. The MC can't reach the MDS optimum
+        // because its energy function bundles arc-distance with spring
+        // and angular terms, and the per-iter noise is too small to
+        // escape local basins. A short GD pass over the same targets
+        // drives log-log Pearson(d, Hi-C) close to FLAMINGO's reference.
+        if (Settings::stressRefineIterations > 0) {
+          stressRefineAnchors(chr, Settings::stressRefineIterations,
+                              Settings::stressRefineLR);
+        }
+
+        // Re-interpolate sub-anchor positions between the refined anchors
+        // so the PDB-level bounding box (which the PdbWriter uses to
+        // rescale the structure) is dominated by the corrected chain, not
+        // by stale per-IB sub-anchor positions that remain from the MC
+        // phase before stressRefine moved the anchors.
+        {
+          // Sub-anchors were added by densifyActiveRegion into clusters[]
+          // at a higher level number than anchors (anchor level + 1). Each
+          // has a genomic_pos between two anchors. Reposition every
+          // sub-anchor by linear interpolation between the two nearest
+          // (in genomic_pos) anchors of the current chromosome. This loses
+          // local loop geometry but yields a coherent chain for
+          // visualization — which is what the user is actually looking at.
+          //
+          // Anchors are at level = clusters[active_region[0]].level
+          // Sub-anchors are at level+1.
+          if (!active_region.empty()) {
+            int anchor_level = clusters[active_region[0]].level;
+            int sub_level    = anchor_level + 1;
+
+            // Sorted genomic_pos array and parallel position array for
+            // binary search. active_region is already sorted by genomic_pos.
+            std::vector<int>     gp_arr(active_region.size());
+            std::vector<vector3> pos_arr(active_region.size());
+            for (size_t i = 0; i < active_region.size(); ++i) {
+              gp_arr[i]  = clusters[active_region[i]].genomic_pos;
+              pos_arr[i] = clusters[active_region[i]].pos;
+            }
+
+            int reposed = 0;
+            for (size_t ci = 0; ci < clusters.size(); ++ci) {
+              if (clusters[ci].level != sub_level) continue;
+              // Require the sub-anchor to live in the same chromosome —
+              // cheapest check is genomic_pos inside the anchor range.
+              int gp = clusters[ci].genomic_pos;
+              if (gp < gp_arr.front() || gp > gp_arr.back()) continue;
+
+              auto it = std::lower_bound(gp_arr.begin(), gp_arr.end(), gp);
+              int j = static_cast<int>(it - gp_arr.begin());
+              if (j <= 0) {
+                clusters[ci].pos = pos_arr[0];
+              } else if (j >= (int)gp_arr.size()) {
+                clusters[ci].pos = pos_arr.back();
+              } else {
+                int g0 = gp_arr[j - 1];
+                int g1 = gp_arr[j];
+                float t = (g1 > g0)
+                            ? (float)(gp - g0) / (float)(g1 - g0)
+                            : 0.5f;
+                const vector3& p0 = pos_arr[j - 1];
+                const vector3& p1 = pos_arr[j];
+                clusters[ci].pos.x = (1.0f - t) * p0.x + t * p1.x;
+                clusters[ci].pos.y = (1.0f - t) * p0.y + t * p1.y;
+                clusters[ci].pos.z = (1.0f - t) * p0.z + t * p1.z;
+              }
+              reposed++;
+            }
+            printf("[stressRefine] reinterpolated %d sub-anchor positions "
+                   "(anchor_level=%d sub_level=%d)\n",
+                   reposed, anchor_level, sub_level);
+          }
+        }
+      }
+    }
   }
 
   printf("[TIMING] Arcs GPU total: %.1f ms\n", total_arcs_ms);
@@ -4183,7 +4330,11 @@ inline void LooperSolver::reconstructClusterArcsDistances(int cluster, int clust
   // calc distances (for every point set proper distance to the next one)
   float dist;
   float noise_size = 0.0f;        // noise for subanchors
-  float noise_size_small = 0.05f; // noise for anchors
+  // Per-iteration perturbation for anchor-level MC. 0.05 is too small for a
+  // global active_region (360 beads, ~21 unit bbox) — MC can't escape the
+  // per-IB local minimum and the long-range Hi-C constraints never bite.
+  // Use noiseAnchorSmall from ini (default 0.05) so ensembles can crank it up.
+  float noise_size_small = Settings::noiseAnchorSmall;
 
   for (size_t i = 0; i + 1 < active_size; ++i) {
     int d = abs(clusters[active_region[i + 1]].genomic_pos -
@@ -5388,6 +5539,60 @@ inline void LooperSolver::calcAnchorExpectedDistancesHeatmap() {
     }
   }
 
+  // Populate expected distances from long_arcs (cross-segment / long-range
+  // Hi-C contacts). long_arcs[k].start/.end are GENOMIC POSITIONS in bp
+  // (set by loadArcsFromMemory), not cluster indices — they were never
+  // translated by markArcs. Resolve them with Anchor::contains(pos) and
+  // then map the local anchor index to the current active_region slot.
+  {
+    const auto& la = arcs.long_arcs[current_chr];
+    if (!la.empty() && arcs.anchors.count(current_chr)) {
+      const auto& anc = arcs.anchors.at(current_chr);
+      const int n_anc = static_cast<int>(anc.size());
+      const int cstart = chr_first_cluster[current_chr];
+
+      // anchor-local idx -> active_region slot; sub-anchor cluster indices
+      // that also sit in active_region (after densifyActiveRegion) fall
+      // outside [cstart, cstart+n_anc) and are correctly ignored.
+      std::vector<int> anc_to_active(n_anc, -1);
+      for (const auto& kv : cluster_to_active_index) {
+        int ci = kv.first;
+        if (ci >= cstart && ci < cstart + n_anc)
+          anc_to_active[ci - cstart] = kv.second;
+      }
+
+      auto pos_to_anc = [&](int pos) -> int {
+        for (int i = 0; i < n_anc; ++i)
+          if (const_cast<Anchor&>(anc[i]).contains(pos)) return i;
+        return -1;
+      };
+
+      int applied = 0, oor = 0, inactive = 0, collision = 0;
+      for (size_t k = 0; k < la.size(); ++k) {
+        int ia = pos_to_anc(la[k].start);
+        int ib = pos_to_anc(la[k].end);
+        if (ia < 0 || ib < 0 || ia == ib) { oor++; continue; }
+        int a = anc_to_active[ia];
+        int b = anc_to_active[ib];
+        if (a < 0 || b < 0) { inactive++; continue; }
+        if (heatmap_exp_dist_anchor.v[a][b] >= 0.0f) { collision++; continue; }
+        float ed = static_cast<float>(freqToDistance(la[k].score, true));
+        heatmap_exp_dist_anchor.v[a][b] = ed;
+        heatmap_exp_dist_anchor.v[b][a] = ed;
+        applied++;
+      }
+      printf("long_arcs->anchor: applied=%d oor=%d inactive=%d collision=%d "
+             "total=%zu  active=%zu\n",
+             applied, oor, inactive, collision, la.size(),
+             active_region.size());
+    }
+  }
+
+  // ---------- implementation of stressRefineAnchors ----------
+  // Placed inline at the end of calcAnchorExpectedDistancesHeatmap so it
+  // can share the same position→anchor translation helpers if needed in
+  // the future. The definition below is a separate member function.
+
   // consider anchor heatmap
   if (Settings::useAnchorHeatmap) {
 
@@ -5419,6 +5624,292 @@ inline void LooperSolver::calcAnchorExpectedDistancesHeatmap() {
       }
     }
   }
+}
+
+// -----------------------------------------------------------------------
+// Gradient-descent stress refinement on anchor positions.
+// Minimises Σ_{i<j, h_ij>0} w_ij * ((d_ij - t_ij) / t_ij)^2 over the 3N
+// coordinate vector, where targets t_ij come from freqToDistance applied
+// to both raw_arcs (arcs.arcs[chr]) and long_arcs (arcs.long_arcs[chr]).
+// Preserves active_region ordering; operates in place on cluster positions.
+// Called at the end of reconstructClustersArcsDistances after the MC
+// global refinement pass.
+// -----------------------------------------------------------------------
+inline void LooperSolver::stressRefineAnchors(const std::string& chr,
+                                              int max_iter, float lr) {
+  if (max_iter <= 0) return;
+  if (active_region.size() < 2) return;
+
+  // Anchors in arcs.anchors[chr] are ordered by pairs-file *registration*,
+  // not by genomic position. Rare bins that only appear later in the file
+  // end up with late cluster indices, scrambling the "consecutive" relation
+  // that the backbone term depends on. Sort active_region by genomic_pos
+  // so adjacent slots are genomically-adjacent anchors.
+  std::sort(active_region.begin(), active_region.end(),
+            [&](int a, int b) {
+              return clusters[a].genomic_pos < clusters[b].genomic_pos;
+            });
+
+  const int N = static_cast<int>(active_region.size());
+  const auto& anc = arcs.anchors.at(chr);
+  const int n_anc = static_cast<int>(anc.size());
+  const int cstart = chr_first_cluster[chr];
+
+  // local anchor idx → active slot (active_region holds global cluster idx;
+  // for this refinement pass active_region IS the anchor list so the slot
+  // is just (cluster_idx - cstart)).
+  std::vector<int> anc_to_active(n_anc, -1);
+  for (int i = 0; i < N; ++i) {
+    int ci = active_region[i];
+    if (ci >= cstart && ci < cstart + n_anc)
+      anc_to_active[ci - cstart] = i;
+  }
+
+  // Collect unique pair targets: (i, j, target).
+  // Short arcs are indexed with cluster indices (shifted by cstart).
+  // Long arcs carry genomic positions — translate via Anchor::contains.
+  struct Pair { int i, j; float t; float w; };
+  std::vector<Pair> pairs;
+  pairs.reserve(8 * N);
+
+  // Hash table to deduplicate (and let raw_arcs win over long_arcs if both
+  // exist for the same pair). Key = i * N + j, with i<j.
+  std::vector<int> seen(static_cast<size_t>(N) * N, -1);
+
+  // Consecutive pairs are only skipped when the backbone spring is active
+  // (k_stretch > 0). When backbone is disabled, the Hi-C term needs to
+  // handle them too so the chain doesn't stretch to infinity.
+  const bool backbone_active = Settings::springConstantStretch > 1e-6f
+                              || Settings::springConstantSqueeze > 1e-6f;
+  auto add_pair = [&](int ai, int aj, float tgt) {
+    if (ai == aj) return;
+    if (ai > aj) std::swap(ai, aj);
+    if (backbone_active && aj - ai <= 1) return;  // consecutive → backbone
+    int key = ai * N + aj;
+    if (seen[key] >= 0) return;
+    seen[key] = static_cast<int>(pairs.size());
+    float w = 1.0f;
+    pairs.push_back({ai, aj, tgt, w});
+  };
+
+  // Short arcs (already in cluster-index space, chromosome-shifted).
+  if (arcs.arcs.count(chr)) {
+    const auto& sa = arcs.arcs.at(chr);
+    for (size_t k = 0; k < sa.size(); ++k) {
+      int ci_a = sa[k].start;
+      int ci_b = sa[k].end;
+      if (ci_a < cstart || ci_a >= cstart + n_anc) continue;
+      if (ci_b < cstart || ci_b >= cstart + n_anc) continue;
+      int ai = anc_to_active[ci_a - cstart];
+      int aj = anc_to_active[ci_b - cstart];
+      if (ai < 0 || aj < 0) continue;
+      float t = static_cast<float>(freqToDistance(sa[k].score, false));
+      if (t > 1e-6f) add_pair(ai, aj, t);
+    }
+  }
+
+  // Long arcs (genomic positions → anchor idx via Anchor::contains).
+  auto pos_to_anc = [&](int pos) -> int {
+    for (int i = 0; i < n_anc; ++i)
+      if (const_cast<Anchor&>(anc[i]).contains(pos)) return i;
+    return -1;
+  };
+  if (arcs.long_arcs.count(chr)) {
+    const auto& la = arcs.long_arcs.at(chr);
+    for (size_t k = 0; k < la.size(); ++k) {
+      int ia = pos_to_anc(la[k].start);
+      int ib = pos_to_anc(la[k].end);
+      if (ia < 0 || ib < 0) continue;
+      int a_slot = anc_to_active[ia];
+      int b_slot = anc_to_active[ib];
+      if (a_slot < 0 || b_slot < 0) continue;
+      float t = static_cast<float>(freqToDistance(la[k].score, false));
+      if (t > 1e-6f) add_pair(a_slot, b_slot, t);
+    }
+  }
+
+  printf("[stressRefine] chr %s: N=%d hic_pairs=%zu max_iter=%d lr=%g\n",
+         chr.c_str(), N, pairs.size(), max_iter, (double)lr);
+  printf("[stressRefine] k_stretch=%g k_squeeze=%g k_angular=%g\n",
+         (double)Settings::springConstantStretch,
+         (double)Settings::springConstantSqueeze,
+         (double)Settings::springAngularConstant);
+
+  // Copy current positions into a flat (N, 3) array.
+  std::vector<vector3> X(N);
+  for (int i = 0; i < N; ++i)
+    X[i] = clusters[active_region[i]].pos;
+
+  // Cache backbone targets once. dist_to_next was set by
+  // reconstructClusterArcsDistances at line ~4279 to
+  // genomicLengthToDistance(genomic_sep) — this is the per-segment chain
+  // target. For 25 kb bins with the default genomicLength constants this
+  // is ~6.59, which matches FLAMINGO's natural consecutive-bead scale.
+  // Compute backbone targets directly from genomic positions — don't rely
+  // on stale clusters[...].dist_to_next written by earlier per-IB passes,
+  // which can carry over values for anchors that were the tail of an IB
+  // (never updated) or cross-chromosome gaps.
+  std::vector<float> bb_target(N, -1.0f);
+  for (int i = 0; i + 1 < N; ++i) {
+    int ci   = active_region[i];
+    int cip1 = active_region[i + 1];
+    int gp_i   = clusters[ci].genomic_pos;
+    int gp_ip1 = clusters[cip1].genomic_pos;
+    int gap = std::abs(gp_ip1 - gp_i);
+    if (gap > 0)
+      bb_target[i] = static_cast<float>(genomicLengthToDistance(gap));
+  }
+  {
+    std::vector<float> tmp;
+    for (int i = 0; i + 1 < N; ++i)
+      if (bb_target[i] > 0.0f) tmp.push_back(bb_target[i]);
+    if (!tmp.empty()) {
+      std::sort(tmp.begin(), tmp.end());
+      printf("[stressRefine] backbone target: n=%zu min=%g median=%g max=%g\n",
+             tmp.size(), (double)tmp.front(),
+             (double)tmp[tmp.size() / 2], (double)tmp.back());
+    }
+  }
+
+  const float k_stretch = Settings::springConstantStretch;
+  const float k_squeeze = Settings::springConstantSqueeze;
+  const float k_angular = Settings::springAngularConstant;
+
+  // Stress energy is:
+  //   E = E_backbone + E_hic + E_angular
+  //   E_backbone = Σ_{i} k_{str|sqz} * ((|X[i+1]-X[i]| - t_i)/t_i)^2
+  //   E_hic      = Σ_{|i-j|>1, h_ij>0}  ((|X[i]-X[j]| - t_ij)/t_ij)^2
+  //   E_angular  = Σ_{i=1..N-2} k_ang * theta_i^3    (cubic, matches pMMC CPU)
+  // Backbone and angular are analytic; angular gradient via finite diff.
+
+  // Gradient descent with simple step shrink.
+  double prev_total = 1e300;
+  float cur_lr = lr;
+  for (int it = 0; it < max_iter; ++it) {
+
+    // Zero gradient
+    std::vector<vector3> G(N);
+    for (int k = 0; k < N; ++k) G[k].set(0.0f, 0.0f, 0.0f);
+
+    double e_back = 0.0, e_hic = 0.0, e_ang = 0.0;
+
+    // ---- (a) backbone analytic ----
+    for (int i = 0; i + 1 < N; ++i) {
+      float t = bb_target[i];
+      if (t <= 1e-6f) continue;
+      vector3 d = X[i] - X[i + 1];
+      float dlen = d.length();
+      if (dlen < 1e-9f) dlen = 1e-9f;
+      float e = (dlen - t) / t;
+      float k = (e >= 0.0f ? k_stretch : k_squeeze);
+      e_back += static_cast<double>(k) * e * e;
+      float g_mag = 2.0f * k * (dlen - t) / (t * t * dlen);
+      vector3 gv(d.x * g_mag, d.y * g_mag, d.z * g_mag);
+      G[i].x     += gv.x; G[i].y     += gv.y; G[i].z     += gv.z;
+      G[i + 1].x -= gv.x; G[i + 1].y -= gv.y; G[i + 1].z -= gv.z;
+    }
+
+    // ---- (b) Hi-C MDS analytic ----
+    for (const Pair& p : pairs) {
+      vector3 d = X[p.i] - X[p.j];
+      float dlen = d.length();
+      if (dlen < 1e-9f) dlen = 1e-9f;
+      float e = (dlen - p.t) / p.t;
+      e_hic += static_cast<double>(p.w) * e * e;
+      float g_mag = 2.0f * p.w * (dlen - p.t) / (p.t * p.t * dlen);
+      vector3 gv(d.x * g_mag, d.y * g_mag, d.z * g_mag);
+      G[p.i].x += gv.x; G[p.i].y += gv.y; G[p.i].z += gv.z;
+      G[p.j].x -= gv.x; G[p.j].y -= gv.y; G[p.j].z -= gv.z;
+    }
+
+    // ---- (c) angular theta^3, FD gradient over the 3 involved beads ----
+    if (k_angular > 0.0f) {
+      const float h = 1e-3f;
+      for (int i = 1; i + 1 < N; ++i) {
+        // Baseline
+        vector3 v1 = X[i]     - X[i - 1];
+        vector3 v2 = X[i + 1] - X[i];
+        float n1 = v1.length(), n2 = v2.length();
+        if (n1 < 1e-9f || n2 < 1e-9f) continue;
+        float c = (v1.x * v2.x + v1.y * v2.y + v1.z * v2.z) / (n1 * n2);
+        if (c > 1.0f) c = 1.0f;
+        if (c < -1.0f) c = -1.0f;
+        float theta = acosf(c);
+        float E0 = k_angular * theta * theta * theta;
+        e_ang += static_cast<double>(E0);
+
+        // FD gradient over X[i-1], X[i], X[i+1]
+        const int idxs[3] = { i - 1, i, i + 1 };
+        for (int bi = 0; bi < 3; ++bi) {
+          int b = idxs[bi];
+          for (int axis = 0; axis < 3; ++axis) {
+            float* xp = &X[b].x + axis;
+            float saved = *xp;
+            *xp = saved + h;
+            vector3 w1 = X[i]     - X[i - 1];
+            vector3 w2 = X[i + 1] - X[i];
+            float m1 = w1.length(), m2 = w2.length();
+            *xp = saved;
+            if (m1 < 1e-9f || m2 < 1e-9f) continue;
+            float cp = (w1.x * w2.x + w1.y * w2.y + w1.z * w2.z) / (m1 * m2);
+            if (cp > 1.0f) cp = 1.0f;
+            if (cp < -1.0f) cp = -1.0f;
+            float theta_p = acosf(cp);
+            float Ep = k_angular * theta_p * theta_p * theta_p;
+            float dE = (Ep - E0) / h;
+            float* gp = &G[b].x + axis;
+            *gp += dE;
+          }
+        }
+      }
+    }
+
+    double total = e_back + e_hic + e_ang;
+
+    // line search: if total rose, back off
+    if (total > prev_total && it > 0) {
+      cur_lr *= 0.5f;
+      if (cur_lr < 1e-6f) {
+        printf("[stressRefine] lr shrunk to %.2g — stopping\n",
+               (double)cur_lr);
+        break;
+      }
+    }
+
+    // position update
+    for (int k = 0; k < N; ++k) {
+      X[k].x -= cur_lr * G[k].x;
+      X[k].y -= cur_lr * G[k].y;
+      X[k].z -= cur_lr * G[k].z;
+    }
+
+    if (it == 0 || it == max_iter - 1 || (it + 1) % 200 == 0) {
+      // compute mean consecutive distance for visibility
+      double sum_nn = 0.0;
+      int cnt_nn = 0;
+      for (int i = 0; i + 1 < N; ++i) {
+        vector3 dd = X[i] - X[i + 1];
+        sum_nn += static_cast<double>(dd.length());
+        cnt_nn++;
+      }
+      double mean_nn = cnt_nn > 0 ? sum_nn / cnt_nn : 0.0;
+      printf("[stressRefine] iter %4d  total=%.3f  back=%.3f  hic=%.3f  "
+             "ang=%.3f  lr=%g  mean_nn=%.4f\n",
+             it + 1, total, e_back, e_hic, e_ang, (double)cur_lr, mean_nn);
+    }
+
+    if (prev_total - total < 1e-7 * std::max(1.0, total) && it > 20) {
+      printf("[stressRefine] converged at iter %d  total=%.3f  "
+             "(back=%.3f hic=%.3f ang=%.3f)\n",
+             it + 1, total, e_back, e_hic, e_ang);
+      break;
+    }
+    prev_total = total;
+  }
+
+  // Write refined positions back.
+  for (int i = 0; i < N; ++i)
+    clusters[active_region[i]].pos = X[i];
 }
 
 inline int LooperSolver::getGenomicLengthExcludingCentromere(string chr, int st,

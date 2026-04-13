@@ -9,6 +9,11 @@ merge.txt
 test/
 docs/
 
+# auxiliary content that should not be committed
+auxiliary/data/
+auxiliary/deliverables/
+auxiliary/docs/
+
 # Test output directories
 *test*/
 *output*/
@@ -19,12 +24,7 @@ loops_*/
 # Benchmark results
 benchmark*/
 benchmark_results.*
-run_benchmark.sh
-run_ensemble_benchmark.sh
-run_quality_comparison.sh
-run_resource_monitor.sh
-run_scalability.sh
-run_speed_benchmark.sh
+
 
 # Test datasets
 datasets/
@@ -40,9 +40,18 @@ build_wsl.sh
 
 # Claude / AI-related files (do not commit)
 .claude/
+*.claude/
+**/.claude/
 CLAUDE.md
-context_checklist.txt
-context*
+claude.md
+claude.yml
+claude.yaml
+.anthropic/
+*claude*
+*CLAUDE*
+# context notes — anything with "context" in the name, at any depth
+*context*
+*CONTEXT*
 requirements_list.md
 iteration_log.txt
 

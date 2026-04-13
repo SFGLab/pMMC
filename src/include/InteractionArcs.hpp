@@ -730,23 +730,30 @@ inline void InteractionArcs::loadArcsFromMemory(
       continue;
 
     // Check segment boundary crossing
-    bool ok = true;
+    bool crosses_split = false;
     for (size_t j = 0; j < predefined_segments.regions.size(); ++j) {
       if (predefined_segments.regions[j].chr == ml.chr1) {
         if ((posa <= predefined_segments.regions[j].start &&
              posb >= predefined_segments.regions[j].start) ||
             (posa <= predefined_segments.regions[j].end &&
              posb >= predefined_segments.regions[j].end)) {
-          ok = false;
+          crosses_split = true;
           break;
         }
       }
     }
-    if (!ok) { arcs_over_splits++; continue; }
 
     int score = ml.count > 0 ? ml.count : (int)ml.score;
     if (score < 1) score = 1;
     InteractionArc arc(posa, posb, score, factor);
+
+    // For dense Hi-C contact data, cross-segment arcs are still valuable:
+    // route them to long_arcs (segment-level heatmap) instead of discarding.
+    if (crosses_split) {
+      arcs_over_splits++;
+      long_arcs[ml.chr1].push_back(arc);
+      continue;
+    }
 
     if (posb - posa > Settings::maxPETClusterLength) {
       long_arcs_cnt++;
